@@ -96,7 +96,7 @@ def _llm_reason(
         return fallback
 
     try:
-        client = _Groq(api_key=api_key)
+        client = _Groq(api_key=api_key, timeout=8.0)
         prompt = _PROMPT_TEMPLATE.format(
             conversion_score=conversion_score,
             original_premium=f"{original_premium:.2f}",

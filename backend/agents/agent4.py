@@ -102,7 +102,7 @@ def _llm_reason(
         return fallback
 
     try:
-        client = _Groq(api_key=api_key)
+        client = _Groq(api_key=api_key, timeout=8.0)
         prompt = _PROMPT_TEMPLATE.format(
             risk_label=risk_label,
             risk_tier=risk_tier,
