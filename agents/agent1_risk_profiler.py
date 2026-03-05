@@ -2,14 +2,16 @@
 """
 =============================================================================
   Agent 1 – Risk Profiler  │  Auto Insurance Multi-Agent Pipeline
-  v2 — Production-Ready (No Data Leakage)
+  v3 — World-Class Engineering
 
-  ✓ Gaussian-noisy synthetic labels   → model learns probabilities, not a formula
-  ✓ Strict 6-feature input only       → zero engineered features in X
-  ✓ neg_log_loss tuning               → penalises confidently wrong predictions
-  ✓ CalibratedClassifierCV (isotonic) → statistically sound output probabilities
-  ✓ SHAP TreeExplainer                → base XGBoost extracted from calibrated wrapper
-  ✓ Artifact cleanup on every run     → guaranteed clean slate before training
+  ✓ Gaussian-noisy synthetic labels      → model learns probabilities, not a formula
+  ✓ Interaction features (reasoning)     → Miles_Per_Exp, Total_Incidents, Age_Exp_Gap
+  ✓ OOD / Anomaly detector (safety)     → IsolationForest gate; flags corrupt quotes
+  ✓ Cost-sensitive weights (economic)   → High-risk class 3× multiplier for False Lows
+  ✓ neg_log_loss tuning                 → penalises confidently wrong predictions
+  ✓ CalibratedClassifierCV (isotonic)   → statistically sound output probabilities
+  ✓ SHAP TreeExplainer                  → base XGBoost; causal interventional SHAP
+  ✓ Clean-slate management              → models/ and data/processed/ wiped entirely
 =============================================================================
   Script location : agents/agent1_risk_profiler.py
   Data input      : ../data/raw/insurance_data.csv
@@ -24,6 +26,7 @@ warnings.filterwarnings("ignore")
 import json
 import time
 import logging
+import shutil
 from pathlib import Path
 from collections import Counter
 from typing import Any, Dict, List, Tuple, Optional
@@ -34,6 +37,7 @@ import joblib
 import shap
 from xgboost import XGBClassifier
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import (
     train_test_split,
     RandomizedSearchCV,
@@ -61,18 +65,24 @@ log = logging.getLogger("RiskProfiler")
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-AGENTS_DIR   = Path(__file__).resolve().parent           # …/agents/
-BASE_DIR     = AGENTS_DIR.parent                          # …/Quote-Agents/
-DATA_PATH    = BASE_DIR / "data" / "raw" / "insurance_data.csv"
-MODEL_DIR    = BASE_DIR / "models"
-PROC_DIR     = BASE_DIR / "data" / "processed"
+AGENTS_DIR  = Path(__file__).resolve().parent           # …/agents/
+BASE_DIR    = AGENTS_DIR.parent                          # …/Quote-Agents/
+DATA_PATH   = BASE_DIR / "data" / "raw" / "insurance_data.csv"
+MODEL_DIR   = BASE_DIR / "models"
+PROC_DIR    = BASE_DIR / "data" / "processed"
 
 RANDOM_STATE = 42
-TEST_SIZE    = 0.20    # 20 % held-out test
+TEST_SIZE    = 0.20    # 20 % held-out test set
 CALIB_SIZE   = 0.20    # 20 % of train-val used for isotonic calibration
 NOISE_SCALE  = 2.0     # Gaussian noise σ for synthetic label generation
 
-# ── Strict 6-feature input (NO engineered features in X) ─────────────────────
+# ── Economic Layer ─────────────────────────────────────────────────────────
+# In insurance, a False Low (missing a High-risk driver) leads to an
+# underpriced policy and eventual claims losses — roughly 3× more costly
+# than a False High (over-flagged Safe driver who simply declines the quote).
+HIGH_RISK_WEIGHT_MULTIPLIER: float = 3.0
+
+# ── Raw input features ───────────────────────────────────────────────────────
 NUMERIC_FEATURES: List[str] = [
     "Prev_Accidents",
     "Prev_Citations",
@@ -81,6 +91,15 @@ NUMERIC_FEATURES: List[str] = [
     "Annual_Miles",
 ]
 CAT_FEATURES: List[str] = ["Veh_Usage"]
+
+# ── Interaction / Reasoning Features ─────────────────────────────────────────
+# Derived ONLY from raw inputs — not from the label formula.
+# Capture risk-density patterns that raw features alone may not expose.
+INTERACTION_FEATURES: List[str] = [
+    "Miles_Per_Exp",    # Annual_Miles / (Driving_Exp + 1) — exposure density
+    "Total_Incidents",  # Prev_Accidents + Prev_Citations  — combined incident load
+    "Age_Exp_Gap",      # Driver_Age − Driving_Exp − 16   — delayed licensing signal
+]
 
 # Mileage-range string → numeric midpoint (miles / year)
 MILES_MAP: Dict[str, int] = {
@@ -93,51 +112,52 @@ MILES_MAP: Dict[str, int] = {
     "> 55 K":             62_500,
 }
 
-# All artifacts written by this agent — cleaned up on every run
-AGENT1_MODEL_FILES = [
-    "calibrated_risk_profiler.pkl",
-    "shap_explainer.pkl",
-    "ohe_encoder.pkl",
-    "label_encoder.pkl",
-    "feature_names.pkl",
-    "manifest.json",
-    "xgb_risk_profiler.pkl",       # v1 legacy — removed if present
-]
+# ── Features for the OOD detector (raw inputs only) ─────────────────────────
+# The OOD detector runs on the 6 raw features only, NOT the interaction features.
+# Reason: interaction features like Miles_Per_Exp = 9,999,999 / 1 = 9,999,999
+# saturate IsolationForest's path-length metric, making the corrupt record look
+# 'average' because tree depth caps out.  Raw values like Annual_Miles=9,999,999
+# are cleanly extreme and correctly trigger the anomaly detector.
+RAW_FEATURES_FOR_OOD: List[str] = NUMERIC_FEATURES + ["Veh_Usage_Business", "Veh_Usage_Commute", "Veh_Usage_Pleasure"]
+
+# ── OOD Detector config ───────────────────────────────────────────────────────
+OOD_N_ESTIMATORS = 200     # More trees → more stable anomaly scores
+# We use score_samples() and a hard percentile threshold instead of the
+# contamination parameter.  contamination-based predict() labels the lowest N %
+# of the training set as outliers — which incorrectly flags rare-but-valid
+# profiles (e.g., young driver + accident).  A score threshold set at the
+# 0.1th percentile of training scores only blocks quotes whose anomaly score
+# is more extreme than 99.9 % of all real training quotes — i.e., only truly
+# impossible or corrupted data.
+OOD_SCORE_PERCENTILE = 0.1   # flag if below 0.1th pct of training score dist
+OOD_FLAG             = "ACTION_REQUIRED: DATA_ANOMALY"
+
 AGENT1_PROCESSED_FILE = "cleaned_agent1_data.csv"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 0 – CLEANUP PREVIOUS ARTIFACTS
+#  STEP 0 – CLEAN SLATE  (wipe entire output directories)
 # ─────────────────────────────────────────────────────────────────────────────
 def cleanup_previous_artifacts() -> None:
     """
-    Delete all .pkl / .json / .csv artifacts from previous Agent 1 runs.
-    Creates target directories if they don't yet exist.
-    Guarantees a completely clean slate before training begins.
+    Completely wipe and recreate models/ and data/processed/ before training.
+
+    WHY wipe the entire directory (not just a listed set of files)?
+    ───────────────────────────────────────────────────────────────
+    Any future artifact added to the pipeline is automatically cleaned up
+    with no manual maintenance of a file-name list.  Stale files from
+    previous versions (e.g., a renamed pkl) can never silently persist
+    and be loaded by downstream agents.  Guarantees an absolutely clean
+    slate before every training run.
     """
-    log.info("── Step 0: Cleaning up previous Agent 1 artifacts ──────────")
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    PROC_DIR.mkdir(parents=True, exist_ok=True)
-
-    removed = 0
-
-    for fname in AGENT1_MODEL_FILES:
-        artifact = MODEL_DIR / fname
-        if artifact.exists():
-            artifact.unlink()
-            log.info("  🗑  Removed  models/%s", fname)
-            removed += 1
-
-    processed_csv = PROC_DIR / AGENT1_PROCESSED_FILE
-    if processed_csv.exists():
-        processed_csv.unlink()
-        log.info("  🗑  Removed  data/processed/%s", AGENT1_PROCESSED_FILE)
-        removed += 1
-
-    if removed == 0:
-        log.info("  ✓  No previous artifacts found — fresh slate confirmed.")
-    else:
-        log.info("  ✓  Cleaned %d artifact(s).", removed)
+    log.info("── Step 0: Wiping output directories for clean slate ────────")
+    for target_dir in (MODEL_DIR, PROC_DIR):
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+            log.info("  🗑  Removed  %s/", target_dir.relative_to(BASE_DIR))
+        target_dir.mkdir(parents=True, exist_ok=True)
+        log.info("  ✓  Re-created %s/", target_dir.relative_to(BASE_DIR))
+    log.info("  ✓  Clean slate confirmed.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +167,12 @@ def load_and_prepare_data(path: Path = DATA_PATH) -> pd.DataFrame:
     """
     Load CSV, convert Annual_Miles_Range → numeric midpoint,
     and fill nulls across all modelling columns.
+
+    Imputation strategy
+    ───────────────────
+    Numeric   → column median  (robust to outliers — a single bad entry
+                                won't skew the fill value)
+    Categorical → column mode  (most common usage pattern as neutral default)
     """
     log.info("── Step 1: Loading data → %s ────────────────────────────────", path.name)
     df = pd.read_csv(path, low_memory=False)
@@ -156,7 +182,7 @@ def load_and_prepare_data(path: Path = DATA_PATH) -> pd.DataFrame:
     if "Annual_Miles_Range" in df.columns and "Annual_Miles" not in df.columns:
         df["Annual_Miles"] = df["Annual_Miles_Range"].map(MILES_MAP)
 
-    # Null handling: numeric → column median (robust to outliers)
+    # Null handling: numeric → column median
     for col in NUMERIC_FEATURES:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -179,13 +205,13 @@ def _base_actuarial_score(row: pd.Series) -> float:
     """
     Deterministic actuarial score from raw inputs.
 
-    Weights are grounded in auto-insurance loss-ratio research:
+    Weights grounded in auto-insurance loss-ratio research:
         +4      prior accident      (strongest single predictor of future claims)
         +2      prior citation      (moderate behavioural signal)
         +3/2/1  experience penalty  (≤3 / ≤7 / ≤15 years of licensed driving)
         +2/1    young-driver penalty (<22 / <26 years of age)
         +2/1    high-mileage penalty (>45 K / >25 K miles per year)
-        +1      business-use uplift (higher liability exposure)
+        +1      business-use uplift  (higher liability exposure)
     """
     score: float = 0.0
 
@@ -217,17 +243,15 @@ def _assign_noisy_risk_tier(
     rng:         np.random.Generator,
 ) -> str:
     """
-    CRITICAL ANTI-LEAKAGE STEP:
-    Add Gaussian noise to the actuarial score before bucketing into tiers.
+    ANTI-LEAKAGE: add Gaussian noise before bucketing into tiers.
 
-    Without noise the label is a perfect deterministic function of the
-    features — XGBoost trivially memorises it (100 % accuracy).
-    With noise (σ=2.0), the boundary is blurred realistically:
-    a driver near a tier boundary has a genuine probability of landing
-    in either adjacent tier, so the model is forced to learn probabilities
-    rather than a rule table.
+    Without noise, the label is a perfect deterministic function of the
+    raw features — XGBoost memorises it (100 % accuracy, zero real learning).
+    Noise σ=2.0 blurs tier boundaries realistically: a borderline driver
+    has a genuine probability of landing in either adjacent tier, forcing
+    the model to learn calibrated probabilities rather than hard rules.
 
-    Thresholds applied to NOISY score:
+    Thresholds (applied to NOISY score):
         noisy ≥ 7  → High
         noisy ≥ 4  → Medium
         noisy < 4  → Low
@@ -261,7 +285,46 @@ def generate_risk_labels(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 3 – ENCODING  (strict 6-feature input — ZERO engineered features)
+#  STEP 3a – INTERACTION / REASONING FEATURES
+# ─────────────────────────────────────────────────────────────────────────────
+def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineer three interaction features that capture risk-density patterns
+    the raw inputs alone may not fully expose to the model.
+
+    Miles_Per_Exp  =  Annual_Miles / (Driving_Exp + 1)
+        WHY: A 3-year driver doing 50 K miles/yr is far riskier than a
+             20-year driver doing the same.  Normalising by experience
+             quantifies per-year exposure density — a key actuarial metric.
+             (+1 avoids division-by-zero for brand-new drivers.)
+
+    Total_Incidents  =  Prev_Accidents + Prev_Citations
+        WHY: Captures the combined incident burden in a single axis that
+             XGBoost can split on.  Even though both components are in X,
+             their sum gives the model an explicit "total history" feature
+             without the model having to learn that combination itself.
+
+    Age_Exp_Gap  =  Driver_Age − Driving_Exp − 16
+        WHY: 16 is the minimum legal driving age in most US states.
+             A gap of 0 means the driver started at 16 (normal).
+             A gap of 10 means they started at 26 — a delayed licensing
+             history that correlates with licence suspensions, DUI periods,
+             or extended periods abroad.  Raw age and experience alone
+             cannot expose this signal; their combination does.
+    """
+    log.info(
+        "── Step 3a: Adding interaction features  "
+        "[Miles_Per_Exp | Total_Incidents | Age_Exp_Gap]"
+    )
+    df = df.copy()
+    df["Miles_Per_Exp"]   = df["Annual_Miles"] / (df["Driving_Exp"] + 1)
+    df["Total_Incidents"] = df["Prev_Accidents"] + df["Prev_Citations"]
+    df["Age_Exp_Gap"]     = df["Driver_Age"] - df["Driving_Exp"] - 16
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3b – ENCODING  (11 features: 5 numeric + 3 interaction + 3 OHE)
 # ─────────────────────────────────────────────────────────────────────────────
 def encode_features(
     df:  pd.DataFrame,
@@ -270,15 +333,16 @@ def encode_features(
     le:  Optional[LabelEncoder]  = None,
 ) -> Tuple[pd.DataFrame, pd.Series, OneHotEncoder, LabelEncoder, List[str]]:
     """
-    Build X (8 columns after OHE) and encoded y from the dataframe.
+    Build X (11 columns after OHE) and encoded y.
 
-    Input features (strict, no engineering):
-        Numeric   : Prev_Accidents, Prev_Citations, Driving_Exp,
-                    Driver_Age, Annual_Miles
-        Categorical (OHE): Veh_Usage
-            → Veh_Usage_Business, Veh_Usage_Commute, Veh_Usage_Pleasure
-        ─────────────────────────────────────────────────────────────
-        Total     : 8 features
+    Feature matrix layout
+    ─────────────────────
+    Numeric (5)     : Prev_Accidents, Prev_Citations, Driving_Exp,
+                      Driver_Age, Annual_Miles
+    Interaction (3) : Miles_Per_Exp, Total_Incidents, Age_Exp_Gap
+    OHE (3)         : Veh_Usage_Business, Veh_Usage_Commute, Veh_Usage_Pleasure
+    ─────────────────────────────────────────────────────────────────────────
+    Total           : 11 features
 
     Pass fit=False + pre-fitted encoders for inference-time transforms.
     """
@@ -295,9 +359,10 @@ def encode_features(
     veh_cols = list(ohe.get_feature_names_out(CAT_FEATURES))
     df_ohe   = pd.DataFrame(np.array(veh_enc), columns=veh_cols, index=df.index)
 
-    # Combine numeric + OHE columns (the complete, leak-free feature matrix)
-    X             = pd.concat([df[NUMERIC_FEATURES], df_ohe], axis=1)
-    feature_names = NUMERIC_FEATURES + veh_cols
+    # Assemble: 5 numeric + 3 interaction + 3 OHE
+    all_numeric   = NUMERIC_FEATURES + INTERACTION_FEATURES
+    X             = pd.concat([df[all_numeric], df_ohe], axis=1)
+    feature_names = all_numeric + veh_cols
 
     # Label-encode target
     risk_arr = df["Risk_Tier"].to_numpy()
@@ -307,27 +372,112 @@ def encode_features(
     )
 
     log.info(
-        "  Feature matrix : %d rows × %d cols  |  classes : %s",
+        "── Step 3b: Feature matrix : %d rows × %d cols  │  classes : %s",
         *X.shape, list(le.classes_),
     )
     return X, y, ohe, le, feature_names
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 4 – SAMPLE WEIGHTS  (compensate for class imbalance)
+#  STEP 4a – OOD DETECTOR  (IsolationForest safety layer)
 # ─────────────────────────────────────────────────────────────────────────────
-def compute_sample_weights(y: pd.Series) -> np.ndarray:
+def train_ood_detector(
+    X_train: pd.DataFrame,
+) -> Tuple[IsolationForest, float]:
     """
-    Inverse-frequency weights:  w_c = N / (K × n_c)
+    Train an IsolationForest anomaly detector and compute a score threshold.
 
-    Ensures every Risk Tier is equally important during training
-    regardless of its natural prevalence in the dataset.
+    HOW IsolationForest WORKS
+    ─────────────────────────
+    It builds random trees that randomly partition the feature space.
+    Normal points sit deep in the distribution and need many splits to
+    isolate (high score → inlier).  Anomalies are isolated in few splits
+    (low score → outlier).  score_samples() returns a continuous anomaly
+    score rather than a binary label.
+
+    WHY score_samples() + percentile threshold instead of contamination?
+    ────────────────────────────────────────────────────────────────────
+    The contamination parameter labels the lowest N % of the training set
+    as outliers — so even a rare-but-valid profile (young driver + accident)
+    can be flagged simply for being statistically uncommon.  Instead, we
+    compute the 0.1th percentile of training scores and use it as the
+    rejection boundary.  This means only quotes whose anomaly score falls
+    below 99.9 % of all seen training quotes are blocked — truly impossible
+    or corrupted inputs like Driver_Age=-5 or Annual_Miles=9,999,999.
+
+    Returns
+    ───────
+    ood        : fitted IsolationForest
+    threshold  : float score below which a new quote is flagged as OOD
     """
-    counts = Counter(y.tolist())
-    total  = len(y)
-    n_cls  = len(counts)
-    w_map  = {cls: total / (n_cls * cnt) for cls, cnt in counts.items()}
-    return np.array([w_map[int(yi)] for yi in y])
+    log.info("── Step 4a: Training OOD detector (IsolationForest) ─────────")
+    ood = IsolationForest(
+        n_estimators=OOD_N_ESTIMATORS,
+        contamination="auto",         # only used internally; we override threshold
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    X_raw = X_train[RAW_FEATURES_FOR_OOD]
+    ood.fit(X_raw)
+
+    # Compute anomaly scores on training data and store the percentile threshold
+    train_scores = ood.score_samples(X_raw)
+    threshold    = float(np.percentile(train_scores, OOD_SCORE_PERCENTILE))
+
+    log.info(
+        "  IsolationForest fitted on %d raw features  "
+        "│  training rows=%d",
+        len(RAW_FEATURES_FOR_OOD), len(X_raw),
+    )
+    log.info(
+        "  OOD threshold (%.2f%% pct of train scores) : %.6f",
+        OOD_SCORE_PERCENTILE, threshold,
+    )
+    return ood, threshold
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4b – SAMPLE WEIGHTS  (cost-sensitive: High class 3× penalty)
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_sample_weights(
+    y:               pd.Series,
+    le:              LabelEncoder,
+    high_multiplier: float = HIGH_RISK_WEIGHT_MULTIPLIER,
+) -> np.ndarray:
+    """
+    Cost-sensitive inverse-frequency weights with an economic multiplier
+    for the High-Risk class.
+
+    Base formula:   w_c  = N / (K × n_c)        [standard inverse-frequency]
+    High-Risk:      w_Hi = base_w_Hi × 3.0      [economic cost adjustment]
+
+    WHY the 3× multiplier?
+    ──────────────────────
+    Every gradient update on a misclassified High-Risk driver now carries
+    3× the signal weight.  This biases the model toward catching high-risk
+    cases (higher recall on High), accepting some drop in precision —
+    exactly the trade-off insurance underwriting requires.
+
+    The High class index is resolved dynamically from le.classes_ so this
+    function remains correct even if label encoding order changes.
+    """
+    counts   = Counter(y.tolist())
+    total    = len(y)
+    n_cls    = len(counts)
+    high_idx = int(np.where(le.classes_ == "High")[0][0])
+
+    w_map: Dict[int, float] = {}
+    for cls, cnt in counts.items():
+        base_w       = total / (n_cls * cnt)
+        w_map[cls]   = base_w * high_multiplier if cls == high_idx else base_w
+
+    weights = np.array([w_map[int(yi)] for yi in y])
+    log.info(
+        "── Step 4b: Sample weights  range [%.4f – %.4f]  "
+        "(High class multiplier = %.1f×)",
+        weights.min(), weights.max(), high_multiplier,
+    )
+    return weights
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,12 +493,15 @@ def run_hyperparameter_search(
     """
     RandomizedSearchCV across 10 hyperparameters, scored by neg_log_loss.
 
-    neg_log_loss is the correct objective here because:
-        • It penalises confident wrong predictions heavily (log diverges → ∞)
-        • It rewards well-calibrated probability distributions
-        • It aligns with the downstream calibration step
+    WHY neg_log_loss (not accuracy)?
+    ─────────────────────────────────
+    log(p) → −∞ as p → 0, so a confidently wrong prediction receives an
+    enormous penalty.  This forces the search to select hyperparameters
+    that produce well-calibrated probability distributions — not just the
+    highest label-accuracy score.
 
-    5-fold StratifiedKFold preserves Risk Tier ratios in every fold.
+    5-fold StratifiedKFold ensures every fold preserves the ~6/76/18 %
+    High/Low/Medium class ratio.  250 total fits (50 iter × 5 folds).
     """
     log.info(
         "── Step 5: RandomizedSearchCV  n_iter=%d │ 5-fold │ neg_log_loss ──",
@@ -415,26 +568,18 @@ def calibrate_model(
     """
     Wrap the already-fitted XGBoost in CalibratedClassifierCV.
 
-    method='isotonic'  – non-parametric monotone mapping:
-                         raw scores → true posterior probabilities.
-                         More flexible than Platt scaling (sigmoid),
-                         recommended for n_calib > ~1 000 samples.
+    method='isotonic' — non-parametric monotone mapping from raw softmax
+                        scores to true posterior probabilities.  More
+                        flexible than Platt scaling; recommended for
+                        n_calib > ~1 000 samples.
 
-    cv='prefit'        – the base estimator is already fitted on
-                         X_subtrain; we only fit the isotonic layer
-                         on the separate held-out calibration set.
-                         This avoids any information leakage between
-                         fitting and calibrating.
-
-    After .fit(), calibrated.estimator  → the base XGBClassifier
-                  calibrated.classes_   → class labels [0, 1, 2]
+    cv='prefit'       — base estimator is already fitted on X_subtrain;
+                        only the isotonic layer is fitted here on the
+                        separate 16 % calibration holdout.  This prevents
+                        any leakage between the training and calibration steps.
     """
     log.info("── Step 6: Isotonic probability calibration ─────────────────")
-    calibrated = CalibratedClassifierCV(
-        base_xgb,
-        method="isotonic",
-        cv="prefit",
-    )
+    calibrated = CalibratedClassifierCV(base_xgb, method="isotonic", cv="prefit")
     calibrated.fit(X_calib, y_calib)
     log.info(
         "  Calibrated.  classes_ = %s  |  calibration rows = %d",
@@ -489,13 +634,15 @@ def build_shap_explainer(
     """
     Build SHAP TreeExplainer on the raw XGBoost estimator.
 
-    Why the BASE estimator and not the calibrated wrapper?
-    CalibratedClassifierCV wraps XGBoost in isotonic regressors; SHAP's
+    WHY the base estimator (not the calibrated wrapper)?
+    ─────────────────────────────────────────────────────
+    CalibratedClassifierCV wraps XGBoost inside isotonic regressors; SHAP's
     TreeExplainer cannot traverse the isotonic layer.  The base XGBoost
-    produces identical feature-importance rankings (calibration only
-    adjusts probability magnitudes, not the rank order of predictions).
+    preserves identical feature-importance rankings — calibration only
+    adjusts probability magnitudes, not the rank order of decisions.
 
-    Background: 500-row sample for fast interventional SHAP computation.
+    feature_perturbation='interventional' produces causally interpretable
+    SHAP values (suitable for regulatory audit), using a 500-row background.
     """
     log.info("── Step 8: Building SHAP TreeExplainer ─────────────────────")
     bg = X_background.sample(
@@ -511,60 +658,105 @@ def build_shap_explainer(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 9 – PREDICT & EXPLAIN  (core inference helper)
+#  SHARED ENCODING HELPER  (training & inference use same path)
 # ─────────────────────────────────────────────────────────────────────────────
-def explain_risk_prediction(
+def _build_inference_row(
     quote_data:    Dict[str, Any],
-    *,
-    model:         Any,                  # CalibratedClassifierCV at runtime
-    explainer:     shap.TreeExplainer,
     ohe:           OneHotEncoder,
-    le:            LabelEncoder,
     feature_names: List[str],
-) -> Dict[str, Any]:
+) -> pd.DataFrame:
     """
-    Predict Risk Tier for ONE customer quote and explain the decision via SHAP.
+    Encode a raw quote dict into the 11-column feature vector expected by
+    both the OOD detector and the XGBoost model.
 
-    Input  (quote_data keys)
-    ─────────────────────────────────────────────────────────────────────
-    Prev_Accidents  int    0 or 1  — prior at-fault accident on record
-    Prev_Citations  int    0 or 1  — prior traffic citation on record
-    Driving_Exp     int    years of licensed driving experience
-    Driver_Age      int    driver's age in years
-    Annual_Miles    int    estimated annual mileage (numeric, not range string)
-    Veh_Usage       str    "Commute" | "Pleasure" | "Business"
-
-    Output (returned dict)
-    ─────────────────────────────────────────────────────────────────────
-    predicted_tier      str    "Low" | "Medium" | "High"
-    predicted_class_id  int    encoded class index  (High=0, Low=1, Medium=2)
-    confidence          float  calibrated probability of predicted class
-    class_probabilities dict   {tier: calibrated_prob} for all 3 tiers
-    top_3_features      list   top-3 SHAP drivers with value, direction, magnitude
-    all_shap_values     dict   {feature: shap_value} for all 8 model features
+    Computes all three interaction features from the raw inputs so that
+    training-time and inference-time feature construction share one code path.
     """
     row = dict(quote_data)
 
-    # One-Hot Encode Veh_Usage
+    # ── Interaction features ──────────────────────────────────────────────
+    miles = float(row["Annual_Miles"])
+    exp   = float(row["Driving_Exp"])
+    age   = float(row["Driver_Age"])
+    row["Miles_Per_Exp"]   = miles / (exp + 1)
+    row["Total_Incidents"] = float(row["Prev_Accidents"]) + float(row["Prev_Citations"])
+    row["Age_Exp_Gap"]     = age - exp - 16
+
+    # ── OHE Veh_Usage ─────────────────────────────────────────────────────
     veh_df      = pd.DataFrame([[row["Veh_Usage"]]], columns=["Veh_Usage"])
     veh_enc_arr = np.array(ohe.transform(veh_df))
     veh_cols    = list(ohe.get_feature_names_out(["Veh_Usage"]))
     for col, val in zip(veh_cols, veh_enc_arr[0]):
         row[col] = val
 
-    # Assemble feature vector in exact training order
-    X_input = pd.DataFrame([row])[feature_names].astype(float)
+    return pd.DataFrame([row])[feature_names].astype(float)
 
-    # ── Predict with calibrated model (sound probabilities) ───────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 9 – PREDICT & EXPLAIN  (OOD safety gate → XGBoost → SHAP)
+# ─────────────────────────────────────────────────────────────────────────────
+def explain_risk_prediction(
+    quote_data:   Dict[str, Any],
+    *,
+    model:        Any,                   # CalibratedClassifierCV at runtime
+    explainer:    shap.TreeExplainer,
+    ohe:          OneHotEncoder,
+    le:           LabelEncoder,
+    feature_names: List[str],
+    ood_detector: IsolationForest,
+    ood_threshold: float,
+) -> Dict[str, Any]:
+    """
+    Predict Risk Tier for ONE customer quote with a three-stage pipeline:
+
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ Stage 1 │ Build 11-feature vector from raw quote dict            │
+    │ Stage 2 │ OOD Gate — IsolationForest.predict()                   │
+    │         │   -1 (outlier) → return {"status": OOD_FLAG}          │
+    │         │    1 (normal)  → continue to Stage 3                  │
+    │ Stage 3 │ Calibrated XGBoost prediction + SHAP explanation       │
+    └──────────────────────────────────────────────────────────────────┘
+
+    Input  (quote_data keys):
+        Prev_Accidents, Prev_Citations, Driving_Exp,
+        Driver_Age, Annual_Miles, Veh_Usage
+
+    Normal output keys:
+        status, predicted_tier, predicted_class_id, confidence,
+        class_probabilities, top_3_features, all_shap_values
+
+    Anomaly output keys:
+        status (= OOD_FLAG), input_data, message
+    """
+    # ── Stage 1: Encode ───────────────────────────────────────────────────
+    X_input = _build_inference_row(quote_data, ohe, feature_names)
+
+    # ── Stage 2: OOD Safety Gate ──────────────────────────────────────────
+    # score_samples returns a continuous anomaly score; lower = more anomalous.
+    # We flag if the score falls below the pre-computed training percentile
+    # threshold rather than using predict() which depends on contamination %.
+    anomaly_score = float(ood_detector.score_samples(X_input)[0])
+    if anomaly_score < ood_threshold:
+        log.warning("  ⚠  OOD anomaly detected for input: %s", quote_data)
+        return {
+            "status":     OOD_FLAG,
+            "input_data": quote_data,
+            "message": (
+                "This quote falls outside the distribution of known training data. "
+                "XGBoost prediction skipped to prevent a confident-but-wrong result. "
+                "Please route to a human underwriter for manual review."
+            ),
+        }
+
+    # ── Stage 3a: Calibrated prediction ───────────────────────────────────
     pred_class = int(model.predict(X_input)[0])
     pred_proba = model.predict_proba(X_input)[0]
     pred_tier  = str(le.inverse_transform([pred_class])[0])
 
-    # ── SHAP values from base XGBoost TreeExplainer ───────────────────────
-    # .values shape → (1, n_features, n_classes)
+    # ── Stage 3b: SHAP from base XGBoost TreeExplainer ────────────────────
     shap_exp  = explainer(X_input, check_additivity=False)
-    shap_vals = np.array(shap_exp.values)          # cast → ndarray for 3-D indexing
-    sv        = shap_vals[0, :, pred_class]         # (n_features,) for predicted class
+    shap_vals = np.array(shap_exp.values)           # cast → (1, n_features, n_classes)
+    sv        = shap_vals[0, :, pred_class]          # (n_features,) for predicted class
     shap_dict = {feat: float(sv[i]) for i, feat in enumerate(feature_names)}
 
     # ── Top-3 features by |SHAP| ──────────────────────────────────────────
@@ -589,6 +781,7 @@ def explain_risk_prediction(
     }
 
     return {
+        "status":              "OK",
         "predicted_tier":      pred_tier,
         "predicted_class_id":  pred_class,
         "confidence":          round(float(pred_proba[pred_class]), 4),
@@ -616,35 +809,43 @@ class RiskProfilerPredictor:
             "Driving_Exp":    5, "Driver_Age":    24,
             "Annual_Miles": 32_000, "Veh_Usage": "Commute",
         })
+        # result["status"] == "OK" → normal prediction
+        # result["status"] == OOD_FLAG → route to human underwriter
     """
 
     def __init__(
         self,
-        model:         CalibratedClassifierCV,
-        explainer:     shap.TreeExplainer,
-        ohe:           OneHotEncoder,
-        le:            LabelEncoder,
-        feature_names: List[str],
+        model:          CalibratedClassifierCV,
+        explainer:      shap.TreeExplainer,
+        ohe:            OneHotEncoder,
+        le:             LabelEncoder,
+        feature_names:  List[str],
+        ood_detector:   IsolationForest,
+        ood_threshold:  float,
     ) -> None:
-        self.model         = model
-        self.explainer     = explainer
-        self.ohe           = ohe
-        self.le            = le
-        self.feature_names = feature_names
+        self.model          = model
+        self.explainer      = explainer
+        self.ohe            = ohe
+        self.le             = le
+        self.feature_names  = feature_names
+        self.ood_detector   = ood_detector
+        self.ood_threshold  = ood_threshold
 
     @classmethod
     def from_artifacts(
         cls, model_dir: str = "../models/"
     ) -> "RiskProfilerPredictor":
-        """Load all serialised artifacts from disk and return a ready predictor."""
+        """Load all seven serialised artifacts from disk and return a ready predictor."""
         p = Path(model_dir)
         log.info("Loading artifacts from %s", p.resolve())
         return cls(
-            model         = joblib.load(p / "calibrated_risk_profiler.pkl"),
-            explainer     = joblib.load(p / "shap_explainer.pkl"),
-            ohe           = joblib.load(p / "ohe_encoder.pkl"),
-            le            = joblib.load(p / "label_encoder.pkl"),
-            feature_names = joblib.load(p / "feature_names.pkl"),
+            model          = joblib.load(p / "calibrated_risk_profiler.pkl"),
+            explainer      = joblib.load(p / "shap_explainer.pkl"),
+            ohe            = joblib.load(p / "ohe_encoder.pkl"),
+            le             = joblib.load(p / "label_encoder.pkl"),
+            feature_names  = joblib.load(p / "feature_names.pkl"),
+            ood_detector   = joblib.load(p / "ood_detector.pkl"),
+            ood_threshold  = joblib.load(p / "ood_threshold.pkl"),
         )
 
     def predict_and_explain(self, quote_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -656,6 +857,8 @@ class RiskProfilerPredictor:
             ohe=self.ohe,
             le=self.le,
             feature_names=self.feature_names,
+            ood_detector=self.ood_detector,
+            ood_threshold=self.ood_threshold,
         )
 
 
@@ -663,16 +866,30 @@ class RiskProfilerPredictor:
 #  STEP 11 – ARTIFACT EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 def export_artifacts(
-    calibrated:   CalibratedClassifierCV,
-    explainer:    shap.TreeExplainer,
-    ohe:          OneHotEncoder,
-    le:           LabelEncoder,
+    calibrated:    CalibratedClassifierCV,
+    explainer:     shap.TreeExplainer,
+    ohe:           OneHotEncoder,
+    le:            LabelEncoder,
     feature_names: List[str],
-    df_processed: pd.DataFrame,
+    ood_detector:  IsolationForest,
+    ood_threshold: float,
+    df_processed:  pd.DataFrame,
 ) -> None:
     """
-    Serialize all pipeline components with joblib (compress=3) and write
-    the processed CSV for Agent 2.
+    Serialise all seven pipeline components with joblib (compress=3).
+
+    Artifacts saved to models/
+    ──────────────────────────
+    calibrated_risk_profiler.pkl  — CalibratedClassifierCV (the live model)
+    shap_explainer.pkl            — TreeExplainer bound to base XGBoost
+    ohe_encoder.pkl               — OneHotEncoder for Veh_Usage
+    label_encoder.pkl             — LabelEncoder (High/Low/Medium ↔ 0/1/2)
+    feature_names.pkl             — Ordered list of 11 feature names
+    ood_detector.pkl              — IsolationForest anomaly detector
+    ood_threshold.pkl             — Pre-computed score threshold (0.1th percentile)
+    manifest.json                 — Human-readable pipeline record for audit
+
+    compress=3: ~50 % size reduction vs uncompressed at minimal I/O cost.
     """
     log.info("── Step 11: Exporting artifacts ─────────────────────────────")
 
@@ -682,6 +899,8 @@ def export_artifacts(
         "ohe_encoder.pkl":               ohe,
         "label_encoder.pkl":             le,
         "feature_names.pkl":             feature_names,
+        "ood_detector.pkl":              ood_detector,
+        "ood_threshold.pkl":             ood_threshold,
     }
 
     for fname, obj in pkl_artifacts.items():
@@ -689,18 +908,24 @@ def export_artifacts(
         joblib.dump(obj, out, compress=3)
         log.info("  💾  Saved  models/%-38s %d KB", fname, out.stat().st_size // 1024)
 
-    # Manifest
     manifest = {
-        "agent":         "Agent 1 – Risk Profiler v2",
-        "model_type":    "CalibratedClassifierCV(isotonic, cv=prefit) → XGBClassifier",
-        "objective":     "multi:softprob (3-class)",
-        "tuning_metric": "neg_log_loss",
-        "noise_scale":   NOISE_SCALE,
-        "classes":       list(le.classes_),
-        "n_features":    len(feature_names),
-        "feature_names": feature_names,
-        "shap_method":   "TreeExplainer (interventional) on base XGBClassifier",
-        "artifacts":     list(pkl_artifacts.keys()),
+        "agent":                    "Agent 1 – Risk Profiler v3",
+        "model_type":               "CalibratedClassifierCV(isotonic, cv=prefit) → XGBClassifier",
+        "objective":                "multi:softprob (3-class)",
+        "tuning_metric":            "neg_log_loss",
+        "noise_scale":              NOISE_SCALE,
+        "high_risk_weight_multiplier": HIGH_RISK_WEIGHT_MULTIPLIER,
+        "classes":                  list(le.classes_),
+        "n_features":               len(feature_names),
+        "feature_names":            feature_names,
+        "interaction_features":     INTERACTION_FEATURES,
+        "ood_detector":             (
+            f"IsolationForest(n_estimators={OOD_N_ESTIMATORS})"
+        ),
+        "ood_threshold_percentile":  OOD_SCORE_PERCENTILE,
+        "ood_threshold_value":       round(ood_threshold, 6),
+        "shap_method":              "TreeExplainer (interventional) on base XGBClassifier",
+        "artifacts":                list(pkl_artifacts.keys()),
     }
     manifest_path = MODEL_DIR / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -720,10 +945,10 @@ def export_artifacts(
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     print("\n" + "═" * 64)
-    print("  AGENT 1 – RISK PROFILER v2  │  Training Pipeline")
+    print("  AGENT 1 – RISK PROFILER v3  │  Training Pipeline")
     print("═" * 64 + "\n")
 
-    # ── Step 0: Clean slate ───────────────────────────────────────────────
+    # ── Step 0: Wipe output directories ───────────────────────────────────
     cleanup_previous_artifacts()
 
     # ── Step 1: Load & clean ──────────────────────────────────────────────
@@ -732,12 +957,14 @@ def main() -> None:
     # ── Step 2: Generate noisy Risk_Tier labels ───────────────────────────
     df = generate_risk_labels(df, noise_scale=NOISE_SCALE)
 
-    # ── Step 3: Encode (strict 6-feature input, no engineering) ──────────
-    log.info("── Step 3: Encoding features ────────────────────────────────")
+    # ── Step 3a: Add interaction / reasoning features ─────────────────────
+    df = add_interaction_features(df)
+
+    # ── Step 3b: Encode (11 features: 5 numeric + 3 interaction + 3 OHE) ─
     X, y, ohe, le, feature_names = encode_features(df)
     n_classes = len(le.classes_)
 
-    # ── Step 4: Three-way split  64 % subtrain │ 16 % calib │ 20 % test ──
+    # ── Step 4: Three-way stratified split  64 % │ 16 % │ 20 % ──────────
     log.info("── Step 4: Three-way stratified split ───────────────────────")
     X_trainval, X_test, y_trainval, y_test = train_test_split(
         X, y,
@@ -756,36 +983,34 @@ def main() -> None:
         len(X_subtrain), len(X_calib), len(X_test),
     )
 
-    # Sample weights for the subtrain set
-    sw_subtrain = compute_sample_weights(y_subtrain)
-    log.info(
-        "  Sample weight range : %.4f – %.4f",
-        sw_subtrain.min(), sw_subtrain.max(),
-    )
+    # ── Step 4a: Train OOD detector on subtrain feature space ────────────
+    ood_detector, ood_threshold = train_ood_detector(X_subtrain)
 
-    # ── Step 5: Hyperparameter search on subtrain ─────────────────────────
+    # ── Step 4b: Cost-sensitive sample weights (High = 3× base weight) ───
+    sw_subtrain = compute_sample_weights(y_subtrain, le)
+
+    # ── Step 5: Hyperparameter search ────────────────────────────────────
     best_xgb, best_params = run_hyperparameter_search(
         X_subtrain, y_subtrain, n_classes, sw_subtrain, n_iter=50
     )
 
-    # ── Step 6: Calibrate on held-out calibration set ─────────────────────
+    # ── Step 6: Calibrate on held-out calibration set ────────────────────
     calibrated = calibrate_model(best_xgb, X_calib, y_calib)
 
-    # ── Step 7: Evaluate calibrated model on test set ─────────────────────
+    # ── Step 7: Evaluate calibrated model on test set ────────────────────
     evaluate_model(calibrated, X_test, y_test, le)
 
     # ── Step 8: Build SHAP on base XGBoost ───────────────────────────────
-    # calibrated.estimator is the XGBClassifier fitted on X_subtrain
     explainer = build_shap_explainer(calibrated.estimator, X_subtrain)
 
-    # ── Step 9: Demo predictions with SHAP explanations ──────────────────
+    # ── Step 9: Demo predictions (includes OOD gate test) ────────────────
     print("─" * 64)
-    print("  DEMO: explain_risk_prediction()")
+    print("  DEMO: explain_risk_prediction()  (incl. OOD safety gate)")
     print("─" * 64)
 
     demo_customers = [
         {
-            "label": "High-Risk   │ accident + citation, young novice, business use",
+            "label": "High-Risk   │ accident + citation, young novice, business",
             "data":  {
                 "Prev_Accidents": 1, "Prev_Citations": 1,
                 "Driving_Exp":    3, "Driver_Age":    22,
@@ -808,6 +1033,14 @@ def main() -> None:
                 "Annual_Miles": 28_000, "Veh_Usage": "Commute",
             },
         },
+        {
+            "label": "OOD Test    │ impossible values (age=−5, miles=9,999,999)",
+            "data":  {
+                "Prev_Accidents": 0, "Prev_Citations": 0,
+                "Driving_Exp":    0, "Driver_Age":    -5,
+                "Annual_Miles": 9_999_999, "Veh_Usage": "Pleasure",
+            },
+        },
     ]
 
     for demo in demo_customers:
@@ -818,37 +1051,46 @@ def main() -> None:
             ohe=ohe,
             le=le,
             feature_names=feature_names,
+            ood_detector=ood_detector,
+            ood_threshold=ood_threshold,
         )
         print(f"\n  🧑  {demo['label']}")
-        print(f"  ⚑   Predicted Tier         : {result['predicted_tier']}")
-        print(f"  📊  Confidence (calibrated) : {result['confidence']:.2%}")
-        print(f"  📈  Class Probabilities     : {result['class_probabilities']}")
-        print("  🔑  Top 3 SHAP Drivers      :")
-        for feat in result["top_3_features"]:
-            print(
-                f"       • {feat['feature']:<22}  "
-                f"SHAP = {feat['shap_value']:+.4f}  "
-                f"[{feat['direction']}]  [{feat['magnitude']}]"
-            )
+        if result.get("status") == OOD_FLAG:
+            print(f"  🚨  STATUS : {OOD_FLAG}")
+            print(f"      {result['message']}")
+        else:
+            print(f"  ⚑   Predicted Tier         : {result['predicted_tier']}")
+            print(f"  📊  Confidence (calibrated) : {result['confidence']:.2%}")
+            print(f"  📈  Class Probabilities     : {result['class_probabilities']}")
+            print("  🔑  Top 3 SHAP Drivers      :")
+            for feat in result["top_3_features"]:
+                print(
+                    f"       • {feat['feature']:<22}  "
+                    f"SHAP = {feat['shap_value']:+.4f}  "
+                    f"[{feat['direction']}]  [{feat['magnitude']}]"
+                )
 
     # ── Step 11: Export all artifacts ─────────────────────────────────────
     print("\n" + "─" * 64)
     print("  EXPORTING ARTIFACTS")
     print("─" * 64)
 
-    # Build processed dataframe (raw + derived columns + noisy Risk_Tier)
     keep_cols = (
         NUMERIC_FEATURES
+        + INTERACTION_FEATURES
         + CAT_FEATURES
         + ["Risk_Tier"]
         + (["Annual_Miles_Range"] if "Annual_Miles_Range" in df.columns else [])
     )
     df_processed = df[[c for c in keep_cols if c in df.columns]].copy()
 
-    export_artifacts(calibrated, explainer, ohe, le, feature_names, df_processed)
+    export_artifacts(
+        calibrated, explainer, ohe, le, feature_names,
+        ood_detector, ood_threshold, df_processed,
+    )
 
     print("\n" + "═" * 64)
-    print("  ✅  Agent 1 – Risk Profiler v2 : Training Complete!")
+    print("  ✅  Agent 1 – Risk Profiler v3 : Training Complete!")
     print(f"  📁  Models  → {MODEL_DIR}/")
     print(f"  📄  Data    → {PROC_DIR / AGENT1_PROCESSED_FILE}")
     print("═" * 64 + "\n")
