@@ -28,7 +28,8 @@ export type RoutingDecision = "AUTO_APPROVE" | "MANUAL_REVIEW" | "REJECT";
 export type AgentDecision =
   | "Auto Approve"
   | "Escalate to Underwriter"
-  | "Agent Follow-Up";
+  | "Agent Follow-Up"
+  | "Reject Application";
 
 export type ShapMagnitude = "HIGH" | "MEDIUM" | "LOW";
 
