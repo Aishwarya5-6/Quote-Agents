@@ -207,7 +207,7 @@ def load_and_prepare_data(path: Path = DATA_PATH) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].mode()[0])
 
-    null_report = df[NUMERIC_FEATURES + CAT_FEATURES].isnull().sum().to_dict()
+    null_report = df[NUMERIC_FEATURES + CAT_FEATURES].isnull().sum().to_dict()  # type: ignore[union-attr]
     log.info("  Null check : %s", null_report)
     return df
 
@@ -851,7 +851,7 @@ def _build_inference_row(
     for col, val in zip(veh_cols, veh_enc_arr[0]):
         row[col] = val
 
-    return pd.DataFrame([row])[feature_names].astype(float)
+    return pd.DataFrame([row])[feature_names].astype(float)  # type: ignore[return-value]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1344,7 +1344,7 @@ def main() -> None:
     evaluate_model(calibrated, X_test, y_test, le)
 
     # ── Step 8: Build SHAP on base XGBoost ───────────────────────────────
-    explainer = build_shap_explainer(calibrated.estimator, X_subtrain)
+    explainer = build_shap_explainer(calibrated.estimator, X_subtrain)  # type: ignore[attr-defined]
 
     # ── Step 9: Demo predictions (includes OOD gate test) ────────────────
     print("─" * 64)
@@ -1435,7 +1435,7 @@ def main() -> None:
 
     export_artifacts(
         calibrated, explainer, ohe, le, feature_names,
-        ood_detector, ood_threshold, training_stats, df_processed,
+        ood_detector, ood_threshold, training_stats, df_processed,  # type: ignore[arg-type]
     )
 
     print("\n" + "═" * 64)

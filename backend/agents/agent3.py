@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 try:
-    from groq import Groq as _Groq
+    from groq import Groq as _Groq  # type: ignore[import-not-found]
     _GROQ_AVAILABLE = True
 except ImportError:
     _GROQ_AVAILABLE = False

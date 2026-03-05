@@ -290,7 +290,7 @@ def encode_features(
 
     # ── OHE Veh_Usage only ────────────────────────────────────────────────────
     X_cat    = df[CAT_FEATURES_A2].copy()
-    cat_enc  = ohe.fit_transform(X_cat) if fit else ohe.transform(X_cat)
+    cat_enc  = ohe.fit_transform(X_cat) if fit else ohe.transform(X_cat)  # type: ignore[arg-type]
     cat_cols = list(ohe.get_feature_names_out(CAT_FEATURES_A2))
 
     X_num = df[NUMERIC_FEATURES_A2].reset_index(drop=True).copy()
@@ -350,7 +350,7 @@ def apply_smote(
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    X_res, y_res = sm.fit_resample(X_train, y_train)
+    X_res, y_res = sm.fit_resample(X_train, y_train)  # type: ignore[misc]
 
     X_res = pd.DataFrame(X_res, columns=X_train.columns)
     y_res = pd.Series(y_res, name="Bind")
@@ -652,16 +652,16 @@ def _build_inference_row(
     tier = str(row.get("Risk_Tier", "Low"))
     if tier not in le_tier.classes_:
         tier = "Low"   # safe fallback for any unseen label
-    row["Risk_Tier_encoded"] = int(le_tier.transform([tier])[0])
+    row["Risk_Tier_encoded"] = int(le_tier.transform([tier])[0])  # type: ignore[arg-type]
 
     # ── OHE Veh_Usage only ────────────────────────────────────────────────────
     cat_df   = pd.DataFrame([[row.get("Veh_Usage", "Pleasure")]], columns=CAT_FEATURES_A2)
     cat_enc  = ohe.transform(cat_df)
     cat_cols = list(ohe.get_feature_names_out(CAT_FEATURES_A2))
-    for col, val in zip(cat_cols, cat_enc[0]):
+    for col, val in zip(cat_cols, cat_enc[0]):  # type: ignore[index]
         row[col] = val
 
-    return pd.DataFrame([row])[feature_names].astype(float)
+    return pd.DataFrame([row])[feature_names].astype(float)  # type: ignore[return-value]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1073,7 +1073,7 @@ def main() -> None:
     evaluate_model(calibrated, X_test, y_test, threshold)
 
     # ── Step 8: Build SHAP on base XGBoost ────────────────────────────────────
-    explainer = build_shap_explainer(calibrated.estimator, X_subtrain_sm)
+    explainer = build_shap_explainer(calibrated.estimator, X_subtrain_sm)  # type: ignore[attr-defined]
 
     # ── Step 9: Export all artifacts (agent2_ prefix; Agent 1 untouched) ──────
     print("─" * 64)
