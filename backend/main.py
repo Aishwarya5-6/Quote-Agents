@@ -39,8 +39,10 @@ Usage
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -120,23 +122,18 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# Build CORS origins: always include localhost for dev, plus any
-# comma-separated production domains from FRONTEND_ORIGINS env var.
-import os as _os
-_cors_extra = [
-    o.strip()
-    for o in _os.environ.get("FRONTEND_ORIGINS", "").split(",")
-    if o.strip()
+# CORS: always allow localhost for dev; add production domains via FRONTEND_ORIGINS env var.
+# Example:  FRONTEND_ORIGINS=https://quote-agents.vercel.app,https://my-app.vercel.app
+_extra_origins = [
+    o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()
 ]
-_cors_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    *_cors_extra,
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        *_extra_origins,
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -560,7 +557,23 @@ async def _run_pipeline(quote: QuoteRequest) -> Any:
     quote_dict: Dict[str, Any] = quote.model_dump()
 
     initial_state: AgentState = {"input_data": quote_dict}
-    final_state: AgentState   = _pipeline.invoke(initial_state)
+
+    # Wrap in a 30-second timeout so the browser never hangs
+    try:
+        final_state: AgentState = await asyncio.wait_for(
+            asyncio.to_thread(_pipeline.invoke, initial_state),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        log.error("Pipeline timed out after 30s  tx=%s", transaction_id)
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={
+                "transaction_id": transaction_id,
+                "status": "TIMEOUT",
+                "detail": "Pipeline took longer than 30 seconds. Please try again.",
+            },
+        )
 
     risk_res  = final_state.get("risk_results",       {})
     conv_res  = final_state.get("conversion_results", {})
