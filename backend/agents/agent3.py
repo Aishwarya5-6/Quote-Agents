@@ -67,7 +67,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # Groq model and generation settings
-_GROQ_MODEL       = "llama3-8b-8192"
+_GROQ_MODEL       = "llama-3.1-8b-instant"  # llama3-8b-8192 is deprecated; use current alias
 _GROQ_MAX_TOKENS  = 150
 _GROQ_TEMPERATURE = 0.7
 
@@ -106,7 +106,7 @@ def _llm_reason(
         return fallback
 
     try:
-        client = _Groq(api_key=api_key, timeout=5.0)  # fail-fast: use _LLM_UI_FALLBACK on slow/bad connections
+        client = _Groq(api_key=api_key, timeout=5.0, max_retries=0)  # fail-fast: no retries on 400
         prompt = _PROMPT_TEMPLATE.format(
             conversion_score=conversion_score,
             original_premium=f"{original_premium:.2f}",

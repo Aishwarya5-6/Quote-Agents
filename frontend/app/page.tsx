@@ -161,11 +161,20 @@ export default function DashboardPage() {
       }
 
       if (res.status === 504 || res.status === 502) {
-        setState({
-          kind: "error",
-          title: "Backend Waking Up",
-          message: "The server is starting up after a period of inactivity. This takes up to 60 seconds on the free tier — please wait a moment and try again.",
-        });
+        const body = await res.json().catch(() => ({}));
+        if (body.status === "TIMEOUT") {
+          setState({
+            kind: "error",
+            title: "Pipeline Timed Out",
+            message: "The analysis took too long to complete. This can happen with complex risk profiles — please try again.",
+          });
+        } else {
+          setState({
+            kind: "error",
+            title: "Backend Waking Up",
+            message: "The server is starting up after a period of inactivity. This takes up to 60 seconds on the free tier — please wait a moment and try again.",
+          });
+        }
         return;
       }
 
@@ -296,6 +305,7 @@ export default function DashboardPage() {
             message={state.error.message}
             details={state.error.input}
             onDismiss={handleEdit}
+            isOod
           />
         )}
 

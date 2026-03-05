@@ -11,9 +11,10 @@ interface ErrorBannerProps {
   message: string;
   details?: Record<string, unknown>;
   onDismiss?: () => void;
+  isOod?: boolean;
 }
 
-export default function ErrorBanner({ title, message, details, onDismiss }: ErrorBannerProps) {
+export default function ErrorBanner({ title, message, details, onDismiss, isOod = false }: ErrorBannerProps) {
   return (
     <motion.div
       initial={{ opacity: 0, y: -10 }}
@@ -59,10 +60,12 @@ export default function ErrorBanner({ title, message, details, onDismiss }: Erro
             </div>
           )}
 
-          <p className="text-xs font-mono text-slate-500 mt-3">
-            This quote has been flagged for human underwriter review.
-            The AI pipeline was halted to prevent a confident-but-wrong prediction.
-          </p>
+          {isOod && (
+            <p className="text-xs font-mono text-slate-500 mt-3">
+              This quote has been flagged for human underwriter review.
+              The AI pipeline was halted to prevent a confident-but-wrong prediction.
+            </p>
+          )}
         </div>
       </div>
     </motion.div>
