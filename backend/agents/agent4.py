@@ -147,7 +147,7 @@ PRI_LOW    = "Low"
 ESCALATE_HARD_THRESHOLD    = 30   # below this → always escalate
 ESCALATE_ACCIDENT_THRESHOLD = 50  # accident present AND score below this → escalate
 REJECT_CONVERSION_CEILING  = 20   # High risk + score below this → reject outright
-AUTO_APPROVE_MIN_SCORE     = 70   # minimum score for auto-approval (strong buying signal required)
+AUTO_APPROVE_MIN_SCORE     = 50   # minimum score for auto-approval (calibrated to model's realistic 50-54% ceiling)
 
 
 # ---------------------------------------------------------------------------
