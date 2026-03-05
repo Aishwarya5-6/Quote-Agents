@@ -289,8 +289,8 @@ def encode_features(
     ).reset_index(drop=True)
 
     # ── OHE Veh_Usage only ────────────────────────────────────────────────────
-    X_cat    = df[CAT_FEATURES_A2].copy()
-    cat_enc  = ohe.fit_transform(X_cat) if fit else ohe.transform(X_cat)  # type: ignore[arg-type]
+    X_cat    = pd.DataFrame(df[CAT_FEATURES_A2].copy())
+    cat_enc  = ohe.fit_transform(X_cat) if fit else ohe.transform(X_cat)
     cat_cols = list(ohe.get_feature_names_out(CAT_FEATURES_A2))
 
     X_num = df[NUMERIC_FEATURES_A2].reset_index(drop=True).copy()
@@ -350,7 +350,8 @@ def apply_smote(
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-    X_res, y_res = sm.fit_resample(X_train, y_train)  # type: ignore[misc]
+    _resampled = sm.fit_resample(X_train, y_train)
+    X_res, y_res = _resampled[0], _resampled[1]
 
     X_res = pd.DataFrame(X_res, columns=X_train.columns)
     y_res = pd.Series(y_res, name="Bind")
@@ -652,16 +653,18 @@ def _build_inference_row(
     tier = str(row.get("Risk_Tier", "Low"))
     if tier not in le_tier.classes_:
         tier = "Low"   # safe fallback for any unseen label
-    row["Risk_Tier_encoded"] = int(le_tier.transform([tier])[0])  # type: ignore[arg-type]
+    row["Risk_Tier_encoded"] = int(np.asarray(le_tier.transform([tier]))[0])
 
     # ── OHE Veh_Usage only ────────────────────────────────────────────────────
     cat_df   = pd.DataFrame([[row.get("Veh_Usage", "Pleasure")]], columns=CAT_FEATURES_A2)
-    cat_enc  = ohe.transform(cat_df)
+    cat_enc  = np.asarray(ohe.transform(cat_df))
     cat_cols = list(ohe.get_feature_names_out(CAT_FEATURES_A2))
-    for col, val in zip(cat_cols, cat_enc[0]):  # type: ignore[index]
+    for col, val in zip(cat_cols, cat_enc[0]):
         row[col] = val
 
-    return pd.DataFrame([row])[feature_names].astype(float)  # type: ignore[return-value]
+    out = pd.DataFrame([row])[feature_names].astype(float)
+    assert isinstance(out, pd.DataFrame)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1073,7 +1076,7 @@ def main() -> None:
     evaluate_model(calibrated, X_test, y_test, threshold)
 
     # ── Step 8: Build SHAP on base XGBoost ────────────────────────────────────
-    explainer = build_shap_explainer(calibrated.estimator, X_subtrain_sm)  # type: ignore[attr-defined]
+    explainer = build_shap_explainer(calibrated.estimator, X_subtrain_sm)  # type: ignore
 
     # ── Step 9: Export all artifacts (agent2_ prefix; Agent 1 untouched) ──────
     print("─" * 64)
