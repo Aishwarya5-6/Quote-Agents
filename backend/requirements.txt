@@ -16,3 +16,12 @@ joblib
 fastapi
 uvicorn[standard]
 pydantic>=2.0
+typing-extensions
+
+# ── Orchestration ─────────────────────────────────────────────────────────────
+langgraph>=0.2
+langchain-core>=0.3
+
+# ── LLM (Agent 3) ─────────────────────────────────────────────────────────────
+groq
+python-dotenv

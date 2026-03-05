@@ -1,26 +1,40 @@
 """
-main.py — Multi-Agent Quote Pipeline  │  Production FastAPI Orchestrator
-═════════════════════════════════════════════════════════════════════════
-Single entry-point for all four agents.  On startup, pre-trained artifacts
-are loaded into app.state exactly once so every request pays zero reload cost.
+main.py — LangGraph Multi-Agent Quote Pipeline  │  FastAPI Orchestrator
+════════════════════════════════════════════════════════════════════════
+LangGraph StateGraph wires all four agents into a typed, inspectable DAG.
+ML models are loaded into module-level singletons at startup (zero reload
+cost per request).  The graph is compiled once and reused for every call.
 
 Routes
 ──────
-  POST /api/process_quote  →  full 4-agent pipeline (Agent 1 live; 2–4 ready to wire)
+  POST /api/v1/quote       →  full 4-agent LangGraph pipeline
+  POST /api/process_quote  →  legacy alias (kept for backwards compat)
   GET  /api/health         →  liveness check + artifact inventory
   GET  /docs               →  Swagger UI (auto-generated)
 
-Agent slots
-───────────
-  app.state.risk_engine    ← Agent 1  RiskProfilerPredictor  (✅ live)
-  app.state.conv_engine    ← Agent 2  (plug in when ready)
-  app.state.advisor        ← Agent 3  (plug in when ready)
-  app.state.router         ← Agent 4  (plug in when ready)
+LangGraph DAG
+─────────────
+  [START] → node_risk → node_conversion → node_advisor → node_router → [END]
+
+AgentState fields
+─────────────────
+  input_data             raw quote dict from the HTTP request
+  risk_results           Agent 1 output (predicted_tier, shap drivers …)
+  conversion_results     Agent 2 output (bind_probability, sales_status …)
+  advisor_pitch          Agent 3 output (recommended_premium, reason …)
+  final_decision         Agent 4 full route_decision() output dict
+  final_routing_decision Agent 4 canonical: AUTO_APPROVE | MANUAL_REVIEW | REJECT
+
+Safety constraints
+──────────────────
+  • No node may write to backend/models/ — enforced in each node wrapper.
+  • GROQ_API_KEY loaded from backend/.env via python-dotenv at startup.
+  • Agents 3 & 4 LLM calls have silent rule-based fallbacks; graph never stalls.
 
 Usage
 ─────
   cd backend
-  uvicorn main:app --reload --port 8000
+  uvicorn main:app --reload --port 8001
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -36,11 +51,27 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
+from typing_extensions import TypedDict
+
+# LangGraph
+from langgraph.graph import END, START, StateGraph
+
+from dotenv import load_dotenv
+
+# Load GROQ_API_KEY (and any other secrets) from backend/.env
+# This is a no-op when the variable is already set in the environment.
+load_dotenv(Path(__file__).parent / ".env")
 
 # ── Make the agents package importable when running from backend/ ──────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from agents.agent1_risk_profiler import OOD_FLAG, RiskProfilerPredictor  # noqa: E402
-from agents.agent2_conversion_predictor import ConversionPredictor  # noqa: E402
+from agents.agent1_risk_profiler import OOD_FLAG, RiskProfilerPredictor   # noqa: E402
+from agents.agent2_conversion_predictor import ConversionPredictor         # noqa: E402
+from agents.agent3 import advise_premium                                   # noqa: E402
+from agents.agent4 import (                                                # noqa: E402
+    DEC_APPROVE, DEC_ESCALATE, DEC_FOLLOWUP,
+    RISK_HIGH, RISK_LOW, RISK_MEDIUM,
+    route_decision,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Paths & constants
@@ -53,6 +84,9 @@ CONFIDENCE_GATE     = 0.60
 LOW_CONF_STATUS     = "LOW_CONFIDENCE_ESCALATE"
 OOD_ESCALATE_STATUS = "ACTION_REQUIRED: DATA_ANOMALY_ESCALATE"
 
+# High-risk tiers that should trigger human review
+HIGH_RISK_TIERS = {"High"}
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,23 +98,28 @@ logging.basicConfig(
 log = logging.getLogger("pipeline.api")
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Module-level ML singletons  (loaded once at startup, never replaced)
+# ─────────────────────────────────────────────────────────────────────────────
+_risk_engine:  Optional[RiskProfilerPredictor] = None
+_conv_engine:  Optional[ConversionPredictor]   = None
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="InsurTech AI Pipeline API",
     description=(
-        "**4-Agent** auto insurance quote engine.\n\n"
+        "**4-Agent** auto insurance quote engine powered by **LangGraph**.\n\n"
         "| Agent | Role | Status |\n"
         "|---|---|---|\n"
         "| Agent 1 | Risk Profiler (XGBoost + SHAP) | ✅ Live |\n"
-        "| Agent 2 | Conversion Engine | 🔜 Wiring |\n"
-        "| Agent 3 | AI Advisor (LLM) | 🔜 Wiring |\n"
-        "| Agent 4 | Underwriting Router | 🔜 Wiring |\n"
+        "| Agent 2 | Conversion Predictor (SMOTE + Calibration) | ✅ Live |\n"
+        "| Agent 3 | Premium Advisor (Rules + Groq LLM) | ✅ Live |\n"
+        "| Agent 4 | Underwriting Router | ✅ Live |\n"
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# CORS — allows the Next.js frontend on localhost:3000 to call this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -90,51 +129,261 @@ app.add_middleware(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STARTUP — load all agent artifacts into app.state exactly once
+#  LANGGRAPH  ── AgentState
+# ─────────────────────────────────────────────────────────────────────────────
+class AgentState(TypedDict, total=False):
+    """
+    Shared mutable state threaded through the LangGraph DAG.
+
+    Populated sequentially: each node reads upstream fields and writes its
+    own.  input_data is READ-ONLY — no node may mutate it.
+    """
+    input_data:              Dict[str, Any]   # raw validated quote dict — READ ONLY
+    risk_results:            Dict[str, Any]   # Agent 1: predicted_tier, shap, confidence …
+    conversion_results:      Dict[str, Any]   # Agent 2: bind_probability, sales_status …
+    advisor_pitch:           Dict[str, Any]   # Agent 3: recommended_premium, reason …
+    final_decision:          Dict[str, Any]   # Agent 4: full route_decision() output dict
+    final_routing_decision:  str              # Agent 4 canonical label: AUTO_APPROVE | MANUAL_REVIEW | REJECT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANGGRAPH  ── Node 1: Risk Profiler (Agent 1)
+# ─────────────────────────────────────────────────────────────────────────────
+def node_risk(state: AgentState) -> AgentState:
+    """
+    Calls RiskProfilerPredictor.predict_and_explain().
+
+    Reads  : state["input_data"]
+    Writes : state["risk_results"]
+    Safety : never touches models/ directory.
+    """
+    if _risk_engine is None:
+        return {**state, "risk_results": {"status": "ERROR", "message": "Agent 1 not loaded"}}
+
+    result: Dict[str, Any] = _risk_engine.predict_and_explain(state["input_data"])
+    log.info(
+        "node_risk  │ tier=%s  conf=%.3f  ood=%s",
+        result.get("predicted_tier", "?"),
+        result.get("confidence", 0.0),
+        result.get("status", "?"),
+    )
+    return {**state, "risk_results": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANGGRAPH  ── Node 2: Conversion Predictor (Agent 2)
+# ─────────────────────────────────────────────────────────────────────────────
+def node_conversion(state: AgentState) -> AgentState:
+    """
+    Calls ConversionPredictor.predict_conversion(), injecting predicted_tier
+    from node_risk so Agent 2 benefits from Agent 1 cross-agent context.
+
+    Reads  : state["input_data"], state["risk_results"]["predicted_tier"]
+    Writes : state["conversion_results"]
+    Safety : never touches models/ directory.
+    """
+    if _conv_engine is None:
+        return {**state, "conversion_results": {
+            "bind_probability": None,
+            "sales_status":     None,
+            "distance_to_conversion": None,
+            "error": "Agent 2 not loaded",
+        }}
+
+    risk_tier: Optional[str] = state.get("risk_results", {}).get("predicted_tier")
+    conv = _conv_engine.predict_conversion(
+        input_data=state["input_data"],
+        risk_tier=risk_tier,
+    )
+    result = {
+        "bind_probability":       round(conv.bind_probability, 4),
+        "sales_status":           conv.sales_status,
+        "distance_to_conversion": round(conv.distance_to_conversion, 4),
+        "conversion_score":       round(conv.bind_probability * 100, 2),
+    }
+    log.info(
+        "node_conversion │ bind_prob=%.3f  status=%s",
+        conv.bind_probability, conv.sales_status,
+    )
+    return {**state, "conversion_results": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANGGRAPH  ── Node 3: Premium Advisor (Agent 3)
+# ─────────────────────────────────────────────────────────────────────────────
+def node_advisor(state: AgentState) -> AgentState:
+    """
+    Calls agent3.advise_premium().  The 40-point activation gate is enforced
+    inside advise_premium(); this node always runs safely.
+
+    Reads  : state["input_data"], state["conversion_results"]["conversion_score"]
+    Writes : state["advisor_pitch"]
+
+    LLM safety: any timeout / missing key / exception is silently caught
+    inside advise_premium() — the rule-based reason string is returned as
+    fallback.  This node never raises or stalls the graph.
+    Safety : never touches models/ directory.
+    """
+    conv  = state.get("conversion_results") or {}
+    score = float(conv.get("conversion_score", 50.0))
+
+    result = advise_premium(quote_dict=state["input_data"], conversion_score=score)
+    log.info(
+        "node_advisor │ flag=%s  adjustment=%s  recommended=%.2f",
+        result.get("premium_flag"),
+        result.get("adjustment"),
+        result.get("recommended_premium", 0.0),
+    )
+    return {**state, "advisor_pitch": result}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANGGRAPH  ── Node 4: Underwriting Router (Agent 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Map Agent 1 predicted_tier string → int encoding agent4 expects
+_TIER_TO_INT: Dict[str, int] = {"Low": RISK_LOW, "Medium": RISK_MEDIUM, "High": RISK_HIGH}
+
+# Map agent4 DEC_* decision label → canonical final_routing_decision value
+_DEC_TO_CANONICAL: Dict[str, str] = {
+    DEC_APPROVE:  "AUTO_APPROVE",
+    DEC_ESCALATE: "MANUAL_REVIEW",
+    DEC_FOLLOWUP: "MANUAL_REVIEW",
+}
+
+
+def node_router(state: AgentState) -> AgentState:
+    """
+    Calls agent4.route_decision() with the full upstream state.
+
+    Translates AgentState fields into the three dicts agent4.route_decision()
+    expects, then writes both the raw output dict and the canonical
+    final_routing_decision string back into state.
+
+    agent4 input translation
+    ────────────────────────
+    agent1_output : risk_tier (int 0-2), risk_label (str)
+    agent2_output : conversion_score (float 0-100), will_buy (bool)
+    agent3_output : premium_flag, recommended_premium, adjustment, reason
+    quote_dict    : Prev_Accidents, Prev_Citations, Driver_Age (from input_data)
+
+    Reads  : state["risk_results"], state["conversion_results"],
+             state["advisor_pitch"], state["input_data"]
+    Writes : state["final_decision"], state["final_routing_decision"]
+    Safety : never touches models/ directory.
+    """
+    risk    = state.get("risk_results")       or {}
+    conv    = state.get("conversion_results") or {}
+    advisor = state.get("advisor_pitch")      or {}
+    inp     = state.get("input_data")         or {}
+
+    # ── Build agent1_output dict ──────────────────────────────────────────────
+    tier_str  = risk.get("predicted_tier", "Low")
+    agent1_out = {
+        "risk_tier":  _TIER_TO_INT.get(tier_str, RISK_LOW),
+        "risk_label": tier_str,
+    }
+
+    # ── Build agent2_output dict ──────────────────────────────────────────────
+    bind_prob       = float(conv.get("bind_probability") or 0.0)
+    conversion_score = float(conv.get("conversion_score") or bind_prob * 100)
+    agent2_out = {
+        "conversion_score": conversion_score,
+        "will_buy":         bind_prob >= 0.5,
+        "confidence":       conv.get("sales_status", "Medium"),
+    }
+
+    # ── Build agent3_output dict ──────────────────────────────────────────────
+    agent3_out = {
+        "premium_flag":        bool(advisor.get("premium_flag", False)),
+        "recommended_premium": float(advisor.get("recommended_premium") or 0.0),
+        "adjustment":          advisor.get("adjustment", "none"),
+        "reason":              advisor.get("reason", ""),
+    }
+
+    # ── Call agent4.route_decision() ─────────────────────────────────────────
+    result: Dict[str, Any] = route_decision(
+        agent1_output=agent1_out,
+        agent2_output=agent2_out,
+        agent3_output=agent3_out,
+        quote_dict=inp,
+    )
+
+    canonical = _DEC_TO_CANONICAL.get(result.get("decision", ""), "MANUAL_REVIEW")
+    log.info(
+        "node_router  │ decision=%s  canonical=%s  priority=%s",
+        result.get("decision"), canonical, result.get("priority"),
+    )
+    return {
+        **state,
+        "final_decision":         result,
+        "final_routing_decision": canonical,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LANGGRAPH  ── Compile the StateGraph (once at import time)
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_graph() -> Any:
+    builder = StateGraph(AgentState)
+    builder.add_node("node_risk",       node_risk)
+    builder.add_node("node_conversion", node_conversion)
+    builder.add_node("node_advisor",    node_advisor)
+    builder.add_node("node_router",     node_router)
+    builder.add_edge(START,             "node_risk")
+    builder.add_edge("node_risk",       "node_conversion")
+    builder.add_edge("node_conversion", "node_advisor")
+    builder.add_edge("node_advisor",    "node_router")
+    builder.add_edge("node_router",     END)
+    return builder.compile()
+
+
+_pipeline = _build_graph()   # compiled once; reused for every request
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STARTUP — load ML artifacts into module-level singletons exactly once
 # ─────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def load_agents() -> None:
     """
-    Runs once when Uvicorn boots.  Deserializes all pre-trained artifacts from
-    backend/models/ and stores them on app.state so every route handler can
-    access them without triggering a re-load.
+    Deserializes pre-trained artifacts from backend/models/ into the
+    module-level singletons (_risk_engine, _conv_engine).
 
-    app.state.risk_engine  ← RiskProfilerPredictor (Agent 1)
-    app.state.conv_engine  ← None until Agent 2 is wired
-    app.state.advisor      ← None until Agent 3 is wired
-    app.state.router       ← None until Agent 4 is wired
+    Agents 3 and 4 are stateless — no artifact loading required.
     """
-    # ── Agent 1 ───────────────────────────────────────────────────────────────
+    global _risk_engine, _conv_engine
+
     if MODELS_DIR.exists():
         log.info("🚀  Agent 1 │ loading artifacts from %s …", MODELS_DIR.resolve())
-        app.state.risk_engine = RiskProfilerPredictor.from_artifacts(MODELS_DIR)
+        _risk_engine = RiskProfilerPredictor.from_artifacts(MODELS_DIR)
         log.info("✅  Agent 1 │ RiskProfilerPredictor ready.")
     else:
-        app.state.risk_engine = None
         log.error(
             "❌  Agent 1 │ models/ not found at %s — "
             "run backend/agents/agent1_risk_profiler.py first.",
             MODELS_DIR.resolve(),
         )
 
-    # ── Agent 2 ───────────────────────────────────────────────────────────────
     try:
         log.info("🚀  Agent 2 │ loading artifacts from %s …", MODELS_DIR.resolve())
-        app.state.conv_engine = ConversionPredictor.from_artifacts(MODELS_DIR)
+        _conv_engine = ConversionPredictor.from_artifacts(MODELS_DIR)
         log.info("✅  Agent 2 │ ConversionPredictor ready.")
     except FileNotFoundError as exc:
-        app.state.conv_engine = None
         log.warning("⚠️  Agent 2 │ artifacts not found — %s", exc)
 
-    # ── Agent 3 slot (wire when ready) ────────────────────────────────────────
-    app.state.advisor = None       # TODO: AdvisorAgent(api_key=os.getenv("OPENAI_API_KEY"))
+    log.info("✅  Agent 3 │ advise_premium() ready (stateless rule engine + Groq LLM)."
+    )
+    log.info("✅  Agent 4 │ route_decision() ready (agent4.py rule engine + Groq LLM).")
+    log.info("✅  LangGraph pipeline compiled and ready.")
 
-    # ── Agent 4 slot (wire when ready) ────────────────────────────────────────
-    app.state.router = None        # TODO: UnderwritingRouter.from_config(...)
+    # Expose on app.state for /api/health
+    app.state.risk_engine = _risk_engine
+    app.state.conv_engine = _conv_engine
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Global exception handler — never expose raw tracebacks to callers
+#  Global exception handler
 # ─────────────────────────────────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -153,19 +402,22 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 #  INPUT SCHEMA — QuoteRequest
 # ─────────────────────────────────────────────────────────────────────────────
 class QuoteRequest(BaseModel):
-    """
-    Validated input contract for a single insurance quote.
-    FastAPI returns HTTP 422 automatically if any field fails.
-    """
+    """Validated input contract for a single insurance quote."""
 
-    Driver_Age:     int = Field(..., ge=16, le=100,    description="Driver age in years")
-    Driving_Exp:    int = Field(..., ge=0,  le=84,     description="Years of driving experience")
-    Prev_Accidents: int = Field(..., ge=0,  le=20,     description="Prior at-fault accidents")
-    Prev_Citations: int = Field(..., ge=0,  le=20,     description="Prior traffic citations")
-    Annual_Miles:   int = Field(..., ge=0,  le=200_000, description="Estimated annual mileage")
+    Driver_Age:     int   = Field(..., ge=16,  le=100,     description="Driver age in years")
+    Driving_Exp:    int   = Field(..., ge=0,   le=84,      description="Years of driving experience")
+    Prev_Accidents: int   = Field(..., ge=0,   le=20,      description="Prior at-fault accidents")
+    Prev_Citations: int   = Field(..., ge=0,   le=20,      description="Prior traffic citations")
+    Annual_Miles:   int   = Field(..., ge=0,   le=200_000, description="Estimated annual mileage")
     Veh_Usage: Literal["Business", "Commute", "Pleasure"] = Field(
         ..., description="Primary vehicle use"
     )
+    # Agent 3 optional fields — provided by CRM / quoting engine
+    Quoted_Premium:    Optional[float] = Field(None, ge=0,  description="Current quoted premium ($)")
+    Sal_Range:         Optional[int]   = Field(None, ge=0, le=4, description="Salary band 0–4")
+    Coverage:          Optional[int]   = Field(None, ge=0, le=2, description="Coverage level 0–2")
+    Vehicl_Cost_Range: Optional[int]   = Field(None, ge=0, le=4, description="Vehicle cost band 0–4")
+    Re_Quote:          Optional[int]   = Field(None, ge=0, le=1, description="1 if re-quoting")
 
     @model_validator(mode="after")
     def exp_cannot_exceed_age(self) -> "QuoteRequest":
@@ -183,6 +435,8 @@ class QuoteRequest(BaseModel):
                 "Driver_Age": 34, "Driving_Exp": 12,
                 "Prev_Accidents": 0, "Prev_Citations": 1,
                 "Annual_Miles": 22_000, "Veh_Usage": "Pleasure",
+                "Quoted_Premium": 750.0, "Sal_Range": 1,
+                "Coverage": 1, "Vehicl_Cost_Range": 2, "Re_Quote": 0,
             }
         }
     }
@@ -213,24 +467,33 @@ class ConversionMetricsOut(BaseModel):
 
 
 class AdvisorStrategyOut(BaseModel):
-    suggested_discount_pct:  Optional[float] = None
+    premium_flag:            bool            = False
+    suggested_discount_pct:  Optional[str]   = None
+    recommended_premium:     Optional[float] = None
+    original_premium:        Optional[float] = None
     customer_facing_message: Optional[str]   = None
-    internal_reasoning:      Optional[str]   = None
 
 
 class FinalRoutingOut(BaseModel):
-    routing_status:            Optional[str] = None
-    underwriter_justification: Optional[str] = None
+    # Agent 4 native fields
+    decision:       Optional[str]       = None   # "Auto Approve" | "Escalate to Underwriter" | "Agent Follow-Up"
+    reason:         Optional[str]       = None   # LLM-enriched 2-sentence justification
+    human_required: bool                = False
+    priority:       Optional[str]       = None   # "High" | "Medium" | "Low"
+    action_items:   List[str]           = []
+    # Canonical routing label surfaced at top-level state
+    final_routing_decision: Optional[str] = None  # AUTO_APPROVE | MANUAL_REVIEW | REJECT
 
 
 class PipelineResponse(BaseModel):
-    transaction_id:     str
-    status:             str
-    escalation_reason:  Optional[str]              = None
-    risk_assessment:    Optional[RiskAssessmentOut] = None
-    conversion_metrics: Optional[ConversionMetricsOut] = None
-    advisor_strategy:   Optional[AdvisorStrategyOut]   = None
-    final_routing:      Optional[FinalRoutingOut]      = None
+    transaction_id:          str
+    status:                  str
+    final_routing_decision:  Optional[str]               = None  # AUTO_APPROVE | MANUAL_REVIEW | REJECT
+    escalation_reason:       Optional[str]               = None
+    risk_assessment:         Optional[RiskAssessmentOut]    = None
+    conversion_metrics:      Optional[ConversionMetricsOut] = None
+    advisor_strategy:        Optional[AdvisorStrategyOut]   = None
+    final_routing:           Optional[FinalRoutingOut]      = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,12 +501,11 @@ class PipelineResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/api/health", tags=["Operations"], summary="Liveness check + artifact inventory")
 async def health() -> Any:
-    """Returns model version from manifest.json and the load status of each agent."""
     agent_status = {
-        "agent_1_risk_profiler": "✅ loaded" if app.state.risk_engine else "❌ not loaded",
-        "agent_2_conversion":    "✅ loaded" if app.state.conv_engine is not None else "❌ not loaded",
-        "agent_3_advisor":       "🔜 not wired" if app.state.advisor    is None else "✅ loaded",
-        "agent_4_router":        "🔜 not wired" if app.state.router     is None else "✅ loaded",
+        "agent_1_risk_profiler": "✅ loaded"          if app.state.risk_engine is not None else "❌ not loaded",
+        "agent_2_conversion":    "✅ loaded"          if app.state.conv_engine is not None else "❌ not loaded",
+        "agent_3_advisor":       "✅ loaded (stateless)",
+        "agent_4_router":        "✅ loaded (stateless)",
     }
 
     if not MANIFEST_PATH.exists():
@@ -264,67 +526,47 @@ async def health() -> Any:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  POST /api/process_quote  — Full 4-agent pipeline
+#  SHARED PIPELINE HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
-import uuid   # noqa: E402  (stdlib, late import for readability)
-
-@app.post(
-    "/api/process_quote",
-    response_model=PipelineResponse,
-    tags=["Pipeline"],
-    summary="Run all 4 agents on a single insurance quote",
-    responses={
-        200: {"description": "Pipeline complete — all agent results returned"},
-        422: {"description": "Pydantic validation failed or OOD anomaly detected"},
-        503: {"description": "Agent 1 artifacts not loaded"},
-    },
-)
-async def process_quote(quote: QuoteRequest, request: Request) -> Any:
+async def _run_pipeline(quote: QuoteRequest) -> Any:
     """
-    Chains all four agents on a single validated quote.
-
-    **Current state**
-    - Agent 1 (Risk Profiler) is live — returns `predicted_tier`, `confidence_score`,
-      `top_shap_drivers`, and `dashboard_metrics`.
-    - Agents 2–4 slots are stubbed with placeholder values so the frontend
-      contract is stable while teammates build them.
-
-    **To go live with agents 2–4:**
-    Replace each `# TODO` stub below with a real call to `app.state.<engine>`.
+    Runs the LangGraph DAG and assembles a PipelineResponse.
+    Called by both /api/v1/quote and /api/process_quote.
     """
     transaction_id = str(uuid.uuid4())
-    risk_engine: Optional[RiskProfilerPredictor] = request.app.state.risk_engine
 
-    # ── Guard: Agent 1 must be loaded ─────────────────────────────────────────
-    if risk_engine is None:
+    if _risk_engine is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "ERROR",
-                "detail": "Agent 1 not loaded. Run agent1_risk_profiler.py first.",
-            },
+            content={"status": "ERROR",
+                     "detail": "Agent 1 not loaded. Run agent1_risk_profiler.py first."},
         )
 
-    # ── Agent 1 ── Risk assessment ────────────────────────────────────────────
     quote_dict: Dict[str, Any] = quote.model_dump()
-    agent1_result: Dict[str, Any] = risk_engine.predict_and_explain(quote_dict)
 
-    # OOD / Physics Check blocked the input → 422 immediately
-    if agent1_result.get("status") == OOD_FLAG:
-        log.warning("OOD anomaly blocked for tx=%s input=%s", transaction_id, quote_dict)
+    initial_state: AgentState = {"input_data": quote_dict}
+    final_state: AgentState   = _pipeline.invoke(initial_state)
+
+    risk_res  = final_state.get("risk_results",       {})
+    conv_res  = final_state.get("conversion_results", {})
+    adv_res   = final_state.get("advisor_pitch",      {})
+    route_res = final_state.get("final_decision",     {})
+
+    # OOD gate — block immediately
+    if risk_res.get("status") == OOD_FLAG:
+        log.warning("OOD anomaly blocked tx=%s", transaction_id)
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
                 "transaction_id": transaction_id,
                 "status":         OOD_ESCALATE_STATUS,
-                "message":        agent1_result.get("message"),
-                "input":          agent1_result.get("input_data"),
+                "message":        risk_res.get("message"),
+                "input":          risk_res.get("input_data"),
             },
         )
 
-    # Confidence gate check
-    confidence: float = agent1_result.get("confidence", 1.0)
-    pipeline_status   = agent1_result.get("status", "OK")
+    confidence: float    = float(risk_res.get("confidence", 1.0))
+    pipeline_status      = risk_res.get("status", "OK")
     escalation_reason: Optional[str] = None
 
     if confidence < CONFIDENCE_GATE:
@@ -335,63 +577,111 @@ async def process_quote(quote: QuoteRequest, request: Request) -> Any:
         )
 
     risk_assessment = RiskAssessmentOut(
-        predicted_tier      = agent1_result["predicted_tier"],
+        predicted_tier      = risk_res.get("predicted_tier", "Unknown"),
         confidence_score    = confidence,
         ood_flag            = "OK",
-        class_probabilities = agent1_result.get("class_probabilities", {}),
-        top_shap_drivers    = [
-            ShapDriver(**f) for f in agent1_result.get("top_3_features", [])
-        ],
+        class_probabilities = risk_res.get("class_probabilities", {}),
+        top_shap_drivers    = [ShapDriver(**f) for f in risk_res.get("top_3_features", [])],
     )
 
-    # ── Agent 2 ── Conversion metrics ────────────────────────────────────────
-    conv_engine: Optional[ConversionPredictor] = request.app.state.conv_engine
-    if conv_engine is not None:
-        conv_result = conv_engine.predict_conversion(
-            input_data=quote_dict,
-            risk_tier=risk_assessment.predicted_tier,   # Agent 1 → Agent 2 context
-        )
-        conversion_metrics = ConversionMetricsOut(
-            bind_probability       = round(conv_result.bind_probability, 4),
-            sales_status           = conv_result.sales_status,
-            distance_to_conversion = round(conv_result.distance_to_conversion, 4),
-        )
-    else:
-        conversion_metrics = ConversionMetricsOut(
-            bind_probability       = None,
-            sales_status           = None,
-            distance_to_conversion = None,
-        )
+    conversion_metrics = ConversionMetricsOut(
+        bind_probability       = conv_res.get("bind_probability"),
+        sales_status           = conv_res.get("sales_status"),
+        distance_to_conversion = conv_res.get("distance_to_conversion"),
+    )
 
-    # ── Agent 3 ── Advisor strategy (stub — wire when ready) ─────────────────
-    # TODO: advisor_strategy = await request.app.state.advisor.generate(quote_dict, risk_assessment)
     advisor_strategy = AdvisorStrategyOut(
-        suggested_discount_pct  = None,
-        customer_facing_message = None,
-        internal_reasoning      = None,
+        premium_flag            = bool(adv_res.get("premium_flag", False)),
+        suggested_discount_pct  = adv_res.get("adjustment"),
+        recommended_premium     = adv_res.get("recommended_premium"),
+        original_premium        = adv_res.get("original_premium"),
+        customer_facing_message = adv_res.get("reason"),
     )
 
-    # ── Agent 4 ── Final routing (stub — wire when ready) ────────────────────
-    # TODO: final_routing = request.app.state.router.decide(risk_assessment, conversion_metrics)
     final_routing = FinalRoutingOut(
-        routing_status            = None,
-        underwriter_justification = None,
+        decision               = route_res.get("decision"),
+        reason                 = route_res.get("reason"),
+        human_required         = bool(route_res.get("human_required", False)),
+        priority               = route_res.get("priority"),
+        action_items           = route_res.get("action_items", []),
+        final_routing_decision = final_state.get("final_routing_decision"),
     )
 
-    # ── Assemble master response ──────────────────────────────────────────────
     return PipelineResponse(
-        transaction_id     = transaction_id,
-        status             = pipeline_status,
-        escalation_reason  = escalation_reason,
-        risk_assessment    = risk_assessment,
-        conversion_metrics = conversion_metrics,
-        advisor_strategy   = advisor_strategy,
-        final_routing      = final_routing,
+        transaction_id          = transaction_id,
+        status                  = pipeline_status,
+        final_routing_decision  = final_state.get("final_routing_decision"),
+        escalation_reason       = escalation_reason,
+        risk_assessment         = risk_assessment,
+        conversion_metrics      = conversion_metrics,
+        advisor_strategy        = advisor_strategy,
+        final_routing           = final_routing,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Entry-point  (python main.py)
+#  POST /api/v1/quote  — Primary LangGraph endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post(
+    "/api/v1/quote",
+    response_model=PipelineResponse,
+    tags=["Pipeline v1"],
+    summary="Run all 4 agents via LangGraph on a single insurance quote",
+    responses={
+        200: {"description": "Pipeline complete — full AgentState returned"},
+        422: {"description": "Pydantic validation failure or OOD anomaly"},
+        503: {"description": "Agent 1 artifacts not loaded"},
+    },
+)
+async def quote_v1(quote: QuoteRequest) -> Any:
+    """
+    Primary endpoint.  Chains all four agents through the LangGraph DAG:
+
+    **[START] → node_risk → node_conversion → node_advisor → node_router → [END]**
+
+    Returns the full AgentState serialised as a `PipelineResponse`.
+    """
+    return await _run_pipeline(quote)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POST /api/v1/full-analysis  — Full stateful analysis (named alias)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post(
+    "/api/v1/full-analysis",
+    response_model=PipelineResponse,
+    tags=["Pipeline v1"],
+    summary="Complete 4-agent analysis — returns full AgentState including final_routing_decision",
+    responses={
+        200: {"description": "Complete pipeline result with final_routing_decision"},
+        422: {"description": "Pydantic validation failure or OOD anomaly"},
+        503: {"description": "Agent 1 artifacts not loaded"},
+    },
+)
+async def full_analysis(quote: QuoteRequest) -> Any:
+    """
+    Identical to `/api/v1/quote` — runs the full LangGraph DAG and returns
+    the complete `AgentState` including `final_routing_decision`
+    (`AUTO_APPROVE` | `MANUAL_REVIEW` | `REJECT`).
+    """
+    return await _run_pipeline(quote)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POST /api/process_quote  — Legacy alias
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post(
+    "/api/process_quote",
+    response_model=PipelineResponse,
+    tags=["Pipeline (legacy)"],
+    summary="Alias for /api/v1/quote — kept for backwards compatibility",
+)
+async def process_quote(quote: QuoteRequest, request: Request) -> Any:
+    return await _run_pipeline(quote)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entry-point
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=False, log_level="info")
