@@ -80,7 +80,10 @@ NOISE_SCALE  = 2.0     # Gaussian noise σ for synthetic label generation
 # In insurance, a False Low (missing a High-risk driver) leads to an
 # underpriced policy and eventual claims losses — roughly 3× more costly
 # than a False High (over-flagged Safe driver who simply declines the quote).
-HIGH_RISK_WEIGHT_MULTIPLIER: float = 3.0
+# A missed Medium-risk (priced as Low) is less severe but still costly —
+# 2× multiplier forces the model to maintain a Medium recall floor.
+HIGH_RISK_WEIGHT_MULTIPLIER:   float = 3.0
+MEDIUM_RISK_WEIGHT_MULTIPLIER: float = 2.0
 
 # ── Raw input features ───────────────────────────────────────────────────────
 NUMERIC_FEATURES: List[str] = [
@@ -126,11 +129,22 @@ OOD_N_ESTIMATORS = 200     # More trees → more stable anomaly scores
 # contamination parameter.  contamination-based predict() labels the lowest N %
 # of the training set as outliers — which incorrectly flags rare-but-valid
 # profiles (e.g., young driver + accident).  A score threshold set at the
-# 0.1th percentile of training scores only blocks quotes whose anomaly score
-# is more extreme than 99.9 % of all real training quotes — i.e., only truly
-# impossible or corrupted data.
-OOD_SCORE_PERCENTILE = 0.1   # flag if below 0.1th pct of training score dist
+# 0.01th percentile of training scores only blocks quotes whose anomaly score
+# is more extreme than 99.99 % of all real training quotes — i.e., only truly
+# impossible or corrupted data.  The deterministic Physics Check (in
+# explain_risk_prediction) handles logically impossible values that the
+# statistical detector may not catch.
+OOD_SCORE_PERCENTILE = 0.01  # flag if below 0.01th pct of training score dist
 OOD_FLAG             = "ACTION_REQUIRED: DATA_ANOMALY"
+
+# ── Observability & Drift Monitor ────────────────────────────────────────────
+DRIFT_THRESHOLD_PCT  = 0.10                         # 10 % mean shift → alert
+DRIFT_ALERT_STATUS   = "SYSTEM_ALERT: DATA_DRIFT_DETECTED"
+DRIFT_OK_STATUS      = "OK: NO_DRIFT_DETECTED"
+
+# ── Counterfactual 'What-If' search ──────────────────────────────────────────
+CF_MILES_STEP        = 1_000   # iterate Annual_Miles down in 1 000 mi steps
+CF_MAX_ITER          = 200     # safety cap — never loop more than 200 times
 
 AGENT1_PROCESSED_FILE = "cleaned_agent1_data.csv"
 
@@ -437,45 +451,193 @@ def train_ood_detector(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 4b – SAMPLE WEIGHTS  (cost-sensitive: High class 3× penalty)
+#  ADVERSARIAL TEST GENERATOR  (Red-Team OOD Safety Verification)
+# ─────────────────────────────────────────────────────────────────────────────
+# A hard-coded suite of logically impossible or physically absurd insurance
+# quotes.  Each example probes a specific failure mode: domain violation,
+# sign error, impossible cross-field relationship, or extreme data corruption.
+ADVERSARIAL_PROFILES: List[Dict[str, Any]] = [
+    {
+        "label": "AGE_EXP_IMPOSSIBLE  │ age=18  but exp=40 (more exp than lifetime)",
+        "data":  {"Driver_Age": 18,  "Driving_Exp": 40, "Prev_Accidents": 0,
+                  "Prev_Citations": 0, "Annual_Miles": 15_000, "Veh_Usage": "Commute"},
+    },
+    {
+        "label": "NEGATIVE_MILEAGE   │ Annual_Miles=-500 (physically impossible)",
+        "data":  {"Driver_Age": 30,  "Driving_Exp": 8,  "Prev_Accidents": 0,
+                  "Prev_Citations": 0, "Annual_Miles": -500, "Veh_Usage": "Pleasure"},
+    },
+    {
+        "label": "CORRUPT_ENTRY      │ age=−5, miles=9,999,999 (data entry corruption)",
+        "data":  {"Driver_Age": -5,  "Driving_Exp": 0,  "Prev_Accidents": 0,
+                  "Prev_Citations": 0, "Annual_Miles": 9_999_999, "Veh_Usage": "Pleasure"},
+    },
+    {
+        "label": "ZERO_AGE           │ Driver_Age=0 (pre-birth driver)",
+        "data":  {"Driver_Age": 0,   "Driving_Exp": 0,  "Prev_Accidents": 5,
+                  "Prev_Citations": 10, "Annual_Miles": 50_000, "Veh_Usage": "Business"},
+    },
+    {
+        "label": "NEGATIVE_INCIDENTS │ Prev_Accidents=−3 (invalid sign flip)",
+        "data":  {"Driver_Age": 35,  "Driving_Exp": 10, "Prev_Accidents": -3,
+                  "Prev_Citations": 0, "Annual_Miles": 20_000, "Veh_Usage": "Commute"},
+    },
+]
+
+
+def generate_adversarial_examples(
+    ood_detector:  IsolationForest,
+    ood_threshold: float,
+    ohe:           OneHotEncoder,
+    feature_names: List[str],
+) -> None:
+    """
+    Red-team the IsolationForest OOD gate with a battery of adversarial quotes.
+
+    Each profile is deliberately impossible or corrupt.  The function:
+      1. Builds the full feature vector for each adversarial input.
+      2. Scores the RAW features (no interaction features) against the detector.
+      3. Logs "✅ BLOCKED" when the gate correctly refuses to predict, and
+         "❌ MISSED"  when a corrupt input slips through uncaught.
+
+    This test runs automatically at the end of every training run so that any
+    future model or threshold change that weakens the safety gate is immediately
+    visible in the training log.
+    """
+    log.info("── Adversarial OOD Gate Test ──────────────────────────────────")
+    n_caught = 0
+    for profile in ADVERSARIAL_PROFILES:
+        X_adv   = _build_inference_row(profile["data"], ohe, feature_names)
+        score   = float(ood_detector.score_samples(X_adv[RAW_FEATURES_FOR_OOD])[0])
+        blocked = score < ood_threshold
+        if blocked:
+            n_caught += 1
+            log.info(
+                "  ✅  BLOCKED  [score=%.4f < threshold=%.4f]  %s",
+                score, ood_threshold, profile["label"],
+            )
+        else:
+            log.warning(
+                "  ❌  MISSED   [score=%.4f ≥ threshold=%.4f]  %s  "
+                "— OOD gate did NOT catch this adversarial input.",
+                score, ood_threshold, profile["label"],
+            )
+    log.info(
+        "  Adversarial Gate Test : %d / %d anomalies correctly BLOCKED.",
+        n_caught, len(ADVERSARIAL_PROFILES),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OBSERVABILITY & DRIFT ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_feature_drift(
+    incoming_batch: List[Dict[str, Any]],
+    training_stats: Dict[str, float],
+) -> Dict[str, Any]:
+    """
+    Compare a batch of incoming live quotes against the training distribution.
+
+    Algorithm
+    ─────────
+    1. Compute the mean of Annual_Miles across the incoming batch.
+    2. Compare to the training mean stored in training_stats.
+    3. If |pct_shift| > DRIFT_THRESHOLD_PCT (10 %), return DRIFT_ALERT_STATUS.
+
+    Parameters
+    ──────────
+    incoming_batch   : list of raw quote dicts (same keys as the 6 raw inputs)
+    training_stats   : {"Annual_Miles_mean": float, ...} saved at training time
+
+    Returns
+    ───────
+    JSON-serialisable dict with:
+      status          — DRIFT_ALERT_STATUS or DRIFT_OK_STATUS
+      feature         — monitored feature name
+      training_mean   — reference mean from training
+      incoming_mean   — mean of the current batch
+      pct_shift       — percentage shift (positive = higher than training)
+      n_samples       — batch size
+    """
+    if not incoming_batch:
+        return {"status": DRIFT_OK_STATUS, "detail": "Empty batch — no drift check performed."}
+
+    train_mean = training_stats.get("Annual_Miles_mean", 0.0)
+    batch_mean = float(
+        np.mean([float(q.get("Annual_Miles", train_mean)) for q in incoming_batch])
+    )
+    pct_shift = (batch_mean - train_mean) / (train_mean + 1e-9)
+    drifted   = abs(pct_shift) > DRIFT_THRESHOLD_PCT
+
+    result: Dict[str, Any] = {
+        "status":        DRIFT_ALERT_STATUS if drifted else DRIFT_OK_STATUS,
+        "feature":       "Annual_Miles",
+        "training_mean": round(train_mean, 2),
+        "incoming_mean": round(batch_mean, 2),
+        "pct_shift_pct": round(pct_shift * 100, 2),
+        "n_samples":     len(incoming_batch),
+    }
+    if drifted:
+        log.warning(
+            "  ⚠  DATA DRIFT on Annual_Miles  "
+            "│  training_mean=%.0f  incoming_mean=%.0f  shift=%+.1f %%",
+            train_mean, batch_mean, pct_shift * 100,
+        )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4b – SAMPLE WEIGHTS  (cost-sensitive: High 3× / Medium 2× penalty)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_sample_weights(
-    y:               pd.Series,
-    le:              LabelEncoder,
-    high_multiplier: float = HIGH_RISK_WEIGHT_MULTIPLIER,
+    y:                 pd.Series,
+    le:                LabelEncoder,
+    high_multiplier:   float = HIGH_RISK_WEIGHT_MULTIPLIER,
+    medium_multiplier: float = MEDIUM_RISK_WEIGHT_MULTIPLIER,
 ) -> np.ndarray:
     """
-    Cost-sensitive inverse-frequency weights with an economic multiplier
-    for the High-Risk class.
+    Cost-sensitive inverse-frequency weights with economic multipliers
+    for the High-Risk and Medium-Risk classes.
 
     Base formula:   w_c  = N / (K × n_c)        [standard inverse-frequency]
     High-Risk:      w_Hi = base_w_Hi × 3.0      [economic cost adjustment]
+    Medium-Risk:    w_Me = base_w_Me × 2.0      [recall-collapse prevention]
+    Low-Risk:       w_Lo = base_w_Lo × 1.0      [no extra penalty]
 
-    WHY the 3× multiplier?
-    ──────────────────────
-    Every gradient update on a misclassified High-Risk driver now carries
-    3× the signal weight.  This biases the model toward catching high-risk
-    cases (higher recall on High), accepting some drop in precision —
-    exactly the trade-off insurance underwriting requires.
+    WHY the 3× / 2× multipliers?
+    ─────────────────────────────
+    High  (3×):  Missing a high-risk driver leads to an underpriced policy
+                 and eventual claims losses — the most expensive error.
+    Medium (2×): Without a boost, XGBoost collapses nearly all Medium
+                 predictions into Low (recall ≈ 0.005).  A 2× multiplier
+                 forces meaningful gradient signal on Medium misclassifications
+                 while keeping the dominant Low class at base weight.
+    Low   (1×):  Largest class — no boost needed.
 
-    The High class index is resolved dynamically from le.classes_ so this
+    Class indices are resolved dynamically from le.classes_ so this
     function remains correct even if label encoding order changes.
     """
-    counts   = Counter(y.tolist())
-    total    = len(y)
-    n_cls    = len(counts)
-    high_idx = int(np.where(le.classes_ == "High")[0][0])
+    counts     = Counter(y.tolist())
+    total      = len(y)
+    n_cls      = len(counts)
+    high_idx   = int(np.where(le.classes_ == "High")[0][0])
+    medium_idx = int(np.where(le.classes_ == "Medium")[0][0])
 
     w_map: Dict[int, float] = {}
     for cls, cnt in counts.items():
-        base_w       = total / (n_cls * cnt)
-        w_map[cls]   = base_w * high_multiplier if cls == high_idx else base_w
+        base_w = total / (n_cls * cnt)
+        if cls == high_idx:
+            w_map[cls] = base_w * high_multiplier
+        elif cls == medium_idx:
+            w_map[cls] = base_w * medium_multiplier
+        else:
+            w_map[cls] = base_w          # Low — no extra penalty
 
     weights = np.array([w_map[int(yi)] for yi in y])
     log.info(
         "── Step 4b: Sample weights  range [%.4f – %.4f]  "
-        "(High class multiplier = %.1f×)",
-        weights.min(), weights.max(), high_multiplier,
+        "(High=%.1f× │ Medium=%.1f× │ Low=1.0×)",
+        weights.min(), weights.max(), high_multiplier, medium_multiplier,
     )
     return weights
 
@@ -728,14 +890,59 @@ def explain_risk_prediction(
     Anomaly output keys:
         status (= OOD_FLAG), input_data, message
     """
-    # ── Stage 1: Encode ───────────────────────────────────────────────────
+    # ── Stage 1a: Deterministic Physics Check ─────────────────────────────
+    # Hard-coded domain rules that catch logically impossible inputs before
+    # the statistical OOD detector even runs.  This is the *last* line of
+    # defence when the predictor is called directly (without the Pydantic API
+    # layer).  Each rule mirrors a physical or legal constraint that no valid
+    # insurance quote can violate.
+    age = float(quote_data.get("Driver_Age", 0))
+    exp = float(quote_data.get("Driving_Exp", 0))
+    miles = float(quote_data.get("Annual_Miles", 0))
+    acc = float(quote_data.get("Prev_Accidents", 0))
+    cit = float(quote_data.get("Prev_Citations", 0))
+
+    physics_violations: List[str] = []
+    if age < 16:
+        physics_violations.append(f"Driver_Age={age} < 16 (below legal driving age)")
+    if miles < 0:
+        physics_violations.append(f"Annual_Miles={miles} < 0 (negative mileage impossible)")
+    if acc < 0:
+        physics_violations.append(f"Prev_Accidents={acc} < 0 (negative count impossible)")
+    if cit < 0:
+        physics_violations.append(f"Prev_Citations={cit} < 0 (negative count impossible)")
+    if exp > (age - 15):
+        physics_violations.append(
+            f"Driving_Exp={exp} > Driver_Age−15={age - 15} "
+            f"(more experience than years since legal driving age)"
+        )
+
+    if physics_violations:
+        log.warning(
+            "  🛑  Deterministic Physics Check FAILED for input: %s │ %s",
+            quote_data, physics_violations,
+        )
+        return {
+            "status":     OOD_FLAG,
+            "input_data": quote_data,
+            "message": (
+                "Deterministic Physics Check Failed: "
+                "Logically impossible driver inputs detected. "
+                + "; ".join(physics_violations)
+            ),
+        }
+
+    # ── Stage 1b: Encode ──────────────────────────────────────────────────
     X_input = _build_inference_row(quote_data, ohe, feature_names)
 
-    # ── Stage 2: OOD Safety Gate ──────────────────────────────────────────
+    # ── Stage 2: OOD Safety Gate (IsolationForest) ────────────────────────
     # score_samples returns a continuous anomaly score; lower = more anomalous.
     # We flag if the score falls below the pre-computed training percentile
     # threshold rather than using predict() which depends on contamination %.
-    anomaly_score = float(ood_detector.score_samples(X_input)[0])
+    # IMPORTANT: slice to RAW_FEATURES_FOR_OOD only — the detector was trained
+    # on the 8 raw features (5 numeric + 3 OHE), NOT the 3 interaction features.
+    # Passing interaction features causes a feature-name mismatch error.
+    anomaly_score = float(ood_detector.score_samples(X_input[RAW_FEATURES_FOR_OOD])[0])
     if anomaly_score < ood_threshold:
         log.warning("  ⚠  OOD anomaly detected for input: %s", quote_data)
         return {
@@ -815,21 +1022,23 @@ class RiskProfilerPredictor:
 
     def __init__(
         self,
-        model:          CalibratedClassifierCV,
-        explainer:      shap.TreeExplainer,
-        ohe:            OneHotEncoder,
-        le:             LabelEncoder,
-        feature_names:  List[str],
-        ood_detector:   IsolationForest,
-        ood_threshold:  float,
+        model:           CalibratedClassifierCV,
+        explainer:       shap.TreeExplainer,
+        ohe:             OneHotEncoder,
+        le:              LabelEncoder,
+        feature_names:   List[str],
+        ood_detector:    IsolationForest,
+        ood_threshold:   float,
+        training_stats:  Dict[str, float],
     ) -> None:
-        self.model          = model
-        self.explainer      = explainer
-        self.ohe            = ohe
-        self.le             = le
-        self.feature_names  = feature_names
-        self.ood_detector   = ood_detector
-        self.ood_threshold  = ood_threshold
+        self.model           = model
+        self.explainer       = explainer
+        self.ohe             = ohe
+        self.le              = le
+        self.feature_names   = feature_names
+        self.ood_detector    = ood_detector
+        self.ood_threshold   = ood_threshold
+        self.training_stats  = training_stats
 
     @classmethod
     def from_artifacts(
@@ -839,18 +1048,115 @@ class RiskProfilerPredictor:
         p = Path(model_dir)
         log.info("Loading artifacts from %s", p.resolve())
         return cls(
-            model          = joblib.load(p / "calibrated_risk_profiler.pkl"),
-            explainer      = joblib.load(p / "shap_explainer.pkl"),
-            ohe            = joblib.load(p / "ohe_encoder.pkl"),
-            le             = joblib.load(p / "label_encoder.pkl"),
-            feature_names  = joblib.load(p / "feature_names.pkl"),
-            ood_detector   = joblib.load(p / "ood_detector.pkl"),
-            ood_threshold  = joblib.load(p / "ood_threshold.pkl"),
+            model           = joblib.load(p / "calibrated_risk_profiler.pkl"),
+            explainer       = joblib.load(p / "shap_explainer.pkl"),
+            ohe             = joblib.load(p / "ohe_encoder.pkl"),
+            le              = joblib.load(p / "label_encoder.pkl"),
+            feature_names   = joblib.load(p / "feature_names.pkl"),
+            ood_detector    = joblib.load(p / "ood_detector.pkl"),
+            ood_threshold   = joblib.load(p / "ood_threshold.pkl"),
+            training_stats  = joblib.load(p / "training_stats.pkl"),
+        )
+
+    def generate_counterfactual_advice(
+        self,
+        quote_data:   Dict[str, Any],
+        current_tier: str,
+    ) -> Optional[str]:
+        """
+        Counterfactual 'What-If' Analyzer for High / Medium risk customers.
+
+        Strategy
+        ────────
+        Two levers are probed in isolation:
+
+        Lever A – Annual Mileage Reduction
+          Iteratively lowers Annual_Miles by CF_MILES_STEP (1 000 mi) until the
+          predicted tier improves to 'Low' or a floor of 1 000 mi is reached.
+
+        Lever B – Incident Record Clearing
+          Sets Prev_Accidents and Prev_Citations to zero and checks whether
+          that single change flips the tier to 'Low'.
+
+        The first lever that achieves a tier improvement is reported in plain
+        English.  If neither lever is sufficient, a generic safe-driver guidance
+        string is returned so the dashboard always has actionable advice.
+
+        Returns None if current_tier is already 'Low' (no improvement needed).
+        """
+        if current_tier == "Low":
+            return None  # already lowest risk tier — no action needed
+
+        # ── Lever A: iterative mileage reduction ──────────────────────────────
+        probe_a       = dict(quote_data)
+        original_miles = int(float(probe_a.get("Annual_Miles", 0)))
+        target         = max(original_miles - CF_MILES_STEP, 1_000)
+        iterations     = 0
+        while target >= 1_000 and iterations < CF_MAX_ITER:
+            probe_a["Annual_Miles"] = target
+            trial = explain_risk_prediction(
+                probe_a,
+                model=self.model,
+                explainer=self.explainer,
+                ohe=self.ohe,
+                le=self.le,
+                feature_names=self.feature_names,
+                ood_detector=self.ood_detector,
+                ood_threshold=self.ood_threshold,
+            )
+            if trial.get("status") == "OK" and trial.get("predicted_tier") == "Low":
+                return (
+                    f"Reducing annual mileage from {original_miles:,} to "
+                    f"{target:,} miles would likely transition this profile "
+                    f"to a Low Risk tier."
+                )
+            target     -= CF_MILES_STEP
+            iterations += 1
+
+        # ── Lever B: clear incident record ────────────────────────────────────
+        probe_b = dict(quote_data)
+        probe_b["Prev_Accidents"] = 0
+        probe_b["Prev_Citations"] = 0
+        trial_b = explain_risk_prediction(
+            probe_b,
+            model=self.model,
+            explainer=self.explainer,
+            ohe=self.ohe,
+            le=self.le,
+            feature_names=self.feature_names,
+            ood_detector=self.ood_detector,
+            ood_threshold=self.ood_threshold,
+        )
+        if trial_b.get("status") == "OK" and trial_b.get("predicted_tier") == "Low":
+            total_incidents = (
+                int(float(quote_data.get("Prev_Accidents", 0)))
+                + int(float(quote_data.get("Prev_Citations", 0)))
+            )
+            return (
+                f"Clearing the {total_incidents} incident record(s) "
+                f"(accidents + citations) would likely transition this profile "
+                f"to a Low Risk tier."
+            )
+
+        # ── Fallback: generic guidance ─────────────────────────────────────────
+        return (
+            f"This profile is currently classified as {current_tier} Risk. "
+            "Sustained incident-free driving and a gradual reduction in annual "
+            "mileage are the strongest levers for improving the risk tier over time."
         )
 
     def predict_and_explain(self, quote_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Entry point for CrewAI tool's _run() method."""
-        return explain_risk_prediction(
+        """
+        Full inference pipeline entry point for CrewAI tool's _run() method.
+
+        Pipeline
+        ────────
+        1. explain_risk_prediction() → OOD gate → XGBoost → SHAP
+        2. calculate_feature_drift() → compares quote against training mean
+        3. generate_counterfactual_advice() → What-If mileage / incident levers
+        4. Assembles dashboard_metrics dict for the frontend What-If tab
+        """
+        result = explain_risk_prediction(
             quote_data,
             model=self.model,
             explainer=self.explainer,
@@ -861,22 +1167,42 @@ class RiskProfilerPredictor:
             ood_threshold=self.ood_threshold,
         )
 
+        # OOD gate fired — skip drift and counterfactual (input is corrupt)
+        if result.get("status") == OOD_FLAG:
+            return result
+
+        # ── Drift Monitor ─────────────────────────────────────────────────────
+        drift_status = calculate_feature_drift([quote_data], self.training_stats)
+
+        # ── Counterfactual Advice ─────────────────────────────────────────────
+        current_tier        = result.get("predicted_tier", "Low")
+        counterfactual_advice = self.generate_counterfactual_advice(
+            quote_data, current_tier
+        )
+
+        result["dashboard_metrics"] = {
+            "drift_status":          drift_status,
+            "counterfactual_advice": counterfactual_advice,
+        }
+        return result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STEP 11 – ARTIFACT EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 def export_artifacts(
-    calibrated:    CalibratedClassifierCV,
-    explainer:     shap.TreeExplainer,
-    ohe:           OneHotEncoder,
-    le:            LabelEncoder,
-    feature_names: List[str],
-    ood_detector:  IsolationForest,
-    ood_threshold: float,
-    df_processed:  pd.DataFrame,
+    calibrated:     CalibratedClassifierCV,
+    explainer:      shap.TreeExplainer,
+    ohe:            OneHotEncoder,
+    le:             LabelEncoder,
+    feature_names:  List[str],
+    ood_detector:   IsolationForest,
+    ood_threshold:  float,
+    training_stats: Dict[str, float],
+    df_processed:   pd.DataFrame,
 ) -> None:
     """
-    Serialise all seven pipeline components with joblib (compress=3).
+    Serialise all eight pipeline components with joblib (compress=3).
 
     Artifacts saved to models/
     ──────────────────────────
@@ -887,6 +1213,7 @@ def export_artifacts(
     feature_names.pkl             — Ordered list of 11 feature names
     ood_detector.pkl              — IsolationForest anomaly detector
     ood_threshold.pkl             — Pre-computed score threshold (0.1th percentile)
+    training_stats.pkl            — Feature means for drift monitoring
     manifest.json                 — Human-readable pipeline record for audit
 
     compress=3: ~50 % size reduction vs uncompressed at minimal I/O cost.
@@ -901,6 +1228,7 @@ def export_artifacts(
         "feature_names.pkl":             feature_names,
         "ood_detector.pkl":              ood_detector,
         "ood_threshold.pkl":             ood_threshold,
+        "training_stats.pkl":            training_stats,
     }
 
     for fname, obj in pkl_artifacts.items():
@@ -924,7 +1252,12 @@ def export_artifacts(
         ),
         "ood_threshold_percentile":  OOD_SCORE_PERCENTILE,
         "ood_threshold_value":       round(ood_threshold, 6),
-        "shap_method":              "TreeExplainer (interventional) on base XGBClassifier",
+        "shap_method":              "TreeExplorer (interventional) on base XGBClassifier",
+        "drift_monitor":            {
+            "monitored_feature":  "Annual_Miles",
+            "threshold_pct":      DRIFT_THRESHOLD_PCT * 100,
+            "training_stats":     training_stats,
+        },
         "artifacts":                list(pkl_artifacts.keys()),
     }
     manifest_path = MODEL_DIR / "manifest.json"
@@ -985,6 +1318,16 @@ def main() -> None:
 
     # ── Step 4a: Train OOD detector on subtrain feature space ────────────
     ood_detector, ood_threshold = train_ood_detector(X_subtrain)
+
+    # ── Step 4a+: Capture training distribution for drift monitoring ─────
+    training_stats: Dict[str, float] = {
+        f"{col}_mean": float(X_subtrain[col].mean())
+        for col in NUMERIC_FEATURES
+    }
+    log.info(
+        "  Training stats captured for drift monitor: %s",
+        {k: round(v, 2) for k, v in training_stats.items()},
+    )
 
     # ── Step 4b: Cost-sensitive sample weights (High = 3× base weight) ───
     sw_subtrain = compute_sample_weights(y_subtrain, le)
@@ -1070,6 +1413,12 @@ def main() -> None:
                     f"[{feat['direction']}]  [{feat['magnitude']}]"
                 )
 
+    # ── Step 9b: Adversarial OOD Gate Test ──────────────────────────────
+    print("\n" + "─" * 64)
+    print("  ADVERSARIAL SAFETY TEST  (Red-Team OOD Gate)")
+    print("─" * 64)
+    generate_adversarial_examples(ood_detector, ood_threshold, ohe, feature_names)
+
     # ── Step 11: Export all artifacts ─────────────────────────────────────
     print("\n" + "─" * 64)
     print("  EXPORTING ARTIFACTS")
@@ -1086,7 +1435,7 @@ def main() -> None:
 
     export_artifacts(
         calibrated, explainer, ohe, le, feature_names,
-        ood_detector, ood_threshold, df_processed,
+        ood_detector, ood_threshold, training_stats, df_processed,
     )
 
     print("\n" + "═" * 64)

@@ -1,0 +1,57 @@
+{
+  "agent": "Agent 1 \u2013 Risk Profiler v3",
+  "model_type": "CalibratedClassifierCV(isotonic, cv=prefit) \u2192 XGBClassifier",
+  "objective": "multi:softprob (3-class)",
+  "tuning_metric": "neg_log_loss",
+  "noise_scale": 2.0,
+  "high_risk_weight_multiplier": 3.0,
+  "classes": [
+    "High",
+    "Low",
+    "Medium"
+  ],
+  "n_features": 11,
+  "feature_names": [
+    "Prev_Accidents",
+    "Prev_Citations",
+    "Driving_Exp",
+    "Driver_Age",
+    "Annual_Miles",
+    "Miles_Per_Exp",
+    "Total_Incidents",
+    "Age_Exp_Gap",
+    "Veh_Usage_Business",
+    "Veh_Usage_Commute",
+    "Veh_Usage_Pleasure"
+  ],
+  "interaction_features": [
+    "Miles_Per_Exp",
+    "Total_Incidents",
+    "Age_Exp_Gap"
+  ],
+  "ood_detector": "IsolationForest(n_estimators=200)",
+  "ood_threshold_percentile": 0.01,
+  "ood_threshold_value": -0.710535,
+  "shap_method": "TreeExplorer (interventional) on base XGBClassifier",
+  "drift_monitor": {
+    "monitored_feature": "Annual_Miles",
+    "threshold_pct": 10.0,
+    "training_stats": {
+      "Prev_Accidents_mean": 0.11119064152555953,
+      "Prev_Citations_mean": 0.11092356177554617,
+      "Driving_Exp_mean": 24.510859462635544,
+      "Driver_Age_mean": 41.510859462635544,
+      "Annual_Miles_mean": 23269.069494150954
+    }
+  },
+  "artifacts": [
+    "calibrated_risk_profiler.pkl",
+    "shap_explainer.pkl",
+    "ohe_encoder.pkl",
+    "label_encoder.pkl",
+    "feature_names.pkl",
+    "ood_detector.pkl",
+    "ood_threshold.pkl",
+    "training_stats.pkl"
+  ]
+}
