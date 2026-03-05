@@ -105,14 +105,18 @@ export default function DashboardPage() {
     }, AGENT_REVEAL_DELAY_MS);
 
     const t0 = performance.now();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000); // 90s for cold starts
 
     try {
       const res = await fetch(`${API_BASE}/api/v1/full-analysis`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify(input),
+        signal:  controller.signal,
       });
 
+      clearTimeout(timeoutId);
       if (timerRef.current) clearInterval(timerRef.current);
       const elapsed = performance.now() - t0;
 
@@ -156,16 +160,27 @@ export default function DashboardPage() {
         return;
       }
 
+      if (res.status === 504 || res.status === 502) {
+        setState({
+          kind: "error",
+          title: "Backend Waking Up",
+          message: "The server is starting up after a period of inactivity. This takes up to 60 seconds on the free tier — please wait a moment and try again.",
+        });
+        return;
+      }
+
       const text = await res.text();
       setState({ kind: "error", title: `HTTP ${res.status}`, message: text || "Unexpected error." });
     } catch (err) {
+      clearTimeout(timeoutId);
       if (timerRef.current) clearInterval(timerRef.current);
+      const isTimeout = err instanceof DOMException && err.name === "AbortError";
       setState({
         kind: "error",
-        title: "Connection Failed",
-        message:
-          `Could not reach the backend at ${API_BASE}. ` +
-          "Make sure uvicorn is running: cd backend && uvicorn main:app --port 8001",
+        title: isTimeout ? "Request Timed Out" : "Connection Failed",
+        message: isTimeout
+          ? "The backend took too long to respond. It may be waking up from sleep — please wait 30 seconds and try again."
+          : "Could not reach the backend. Please check your connection and try again.",
       });
     }
   }, []);
@@ -296,6 +311,17 @@ export default function DashboardPage() {
         {/* ── Sequential Agent Cards ─────────────────────────────────── */}
         {(isRunning || isComplete) && (
           <div className="flex flex-col items-center">
+            {/* Cold-start notice — only shown while loading */}
+            {isRunning && !data && (
+              <motion.div
+                initial={{ opacity: 0, y: -6 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="w-full mb-4 flex items-center gap-2.5 px-4 py-2.5 rounded-lg border border-amber-500/20 bg-amber-500/5 text-xs text-amber-300/80 font-mono"
+              >
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
+                First request may take up to 60s — backend wakes from sleep on Render free tier. Please wait…
+              </motion.div>
+            )}
             {/* ─── Agent 1: Risk Profiler ──────────────────────────── */}
             <div className="w-full">
               <StorytellingCard
