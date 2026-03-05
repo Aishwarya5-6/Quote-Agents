@@ -88,14 +88,30 @@ interface QuoteFormProps {
 }
 
 export default function QuoteForm({ onSubmit, disabled }: QuoteFormProps) {
-  const [values, setValues] = useState<Record<string, string>>(buildDefaults);
+  const [values, setValues]   = useState<Record<string, string>>(buildDefaults);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const handleChange = (key: string, val: string) => {
     setValues((prev) => ({ ...prev, [key]: val }));
+    // Clear error as soon as the user starts correcting
+    setFormError(null);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError(null);
+
+    const age = Number(values["Driver_Age"]);
+    const exp = Number(values["Driving_Exp"]);
+    const maxExp = age - 16;
+
+    if (exp > maxExp) {
+      setFormError(
+        `Driving Experience (${exp} yrs) cannot exceed Driver Age − 16 = ${maxExp} yrs. ` +
+        `Please lower Driving Experience or raise Driver Age.`
+      );
+      return;
+    }
 
     const result: Record<string, unknown> = {};
     for (const f of FIELDS) {
@@ -124,39 +140,59 @@ export default function QuoteForm({ onSubmit, disabled }: QuoteFormProps) {
         Quote Input
       </p>
 
+      {/* Cross-field validation error */}
+      {formError && (
+        <div className="mb-4 rounded-lg border border-rose-500/50 bg-rose-500/10 px-4 py-3 text-xs font-mono text-rose-400 leading-relaxed">
+          ⚠ {formError}
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-x-3 gap-y-3">
-        {FIELDS.map((f) => (
-          <div key={f.key} className={f.key === "Annual_Miles" ? "col-span-2" : ""}>
-            <label className="block text-[10px] font-mono text-slate-500 mb-1 uppercase tracking-wider">
-              {f.label} {f.required && <span className="text-violet-400">*</span>}
-            </label>
-            {f.type === "select" ? (
-              <select
-                value={values[f.key]}
-                onChange={(e) => handleChange(f.key, e.target.value)}
-                disabled={disabled}
-                className={inputCls}
-              >
-                {f.options!.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                type="number"
-                value={values[f.key]}
-                onChange={(e) => handleChange(f.key, e.target.value)}
-                min={f.min}
-                max={f.max}
-                step={f.step ?? 1}
-                disabled={disabled}
-                className={inputCls}
-              />
-            )}
-          </div>
-        ))}
+        {FIELDS.map((f) => {
+          // Live max for Driving_Exp: cannot exceed Driver_Age − 16
+          const liveMax =
+            f.key === "Driving_Exp"
+              ? Math.max(0, Number(values["Driver_Age"] ?? 16) - 16)
+              : f.max;
+
+          return (
+            <div key={f.key} className={f.key === "Annual_Miles" ? "col-span-2" : ""}>
+              <label className="block text-[10px] font-mono text-slate-500 mb-1 uppercase tracking-wider">
+                {f.label}{f.required && <span className="text-violet-400"> *</span>}
+                {f.key === "Driving_Exp" && (
+                  <span className="ml-2 text-slate-600 normal-case tracking-normal">
+                    (max {liveMax} yrs for this age)
+                  </span>
+                )}
+              </label>
+              {f.type === "select" ? (
+                <select
+                  value={values[f.key]}
+                  onChange={(e) => handleChange(f.key, e.target.value)}
+                  disabled={disabled}
+                  className={inputCls}
+                >
+                  {f.options!.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  type="number"
+                  value={values[f.key]}
+                  onChange={(e) => handleChange(f.key, e.target.value)}
+                  min={f.min}
+                  max={liveMax}
+                  step={f.step ?? 1}
+                  disabled={disabled}
+                  className={inputCls}
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <button
