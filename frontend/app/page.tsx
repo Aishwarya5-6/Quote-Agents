@@ -31,7 +31,7 @@ export default function DashboardPage() {
     // ── MOCK (swap this block when backend is ready) ─────────────────────────
     const json = MOCK_PIPELINE_RESPONSE;
     // ── LIVE (uncomment to connect to the real pipeline) ─────────────────────
-    // const res  = await fetch("http://localhost:8000/api/process_quote", {
+    // const res  = await fetch("http://localhost:8001/api/process_quote", {
     //   method:  "POST",
     //   headers: { "Content-Type": "application/json" },
     //   body:    JSON.stringify({

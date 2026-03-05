@@ -1,0 +1,71 @@
+{
+  "agent": "Agent 2 \u2013 Conversion Predictor v2",
+  "model_type": "CalibratedClassifierCV(isotonic, cv=prefit) \u2192 XGBClassifier",
+  "objective": "binary:logistic",
+  "tuning_metric": "neg_log_loss (5-fold StratifiedKFold)",
+  "imbalance_handling": "SMOTE(k_neighbors=5) on training split only",
+  "calibration": "CalibratedClassifierCV(method='isotonic', cv='prefit')",
+  "threshold_method": "precision_recall_curve \u2192 argmax(F1)",
+  "optimal_threshold": 0.333333,
+  "threshold_metrics": {
+    "optimal_threshold": 0.333333,
+    "precision_at_threshold": 0.5058,
+    "recall_at_threshold": 0.9334,
+    "f1_at_threshold": 0.6561,
+    "auc_pr": 0.5311,
+    "roc_auc": 0.5907
+  },
+  "near_miss_band": 0.1,
+  "numeric_features": [
+    "Prev_Accidents",
+    "Prev_Citations",
+    "Driving_Exp",
+    "Driver_Age",
+    "Annual_Miles",
+    "Miles_Per_Exp",
+    "Total_Incidents",
+    "Age_Exp_Gap"
+  ],
+  "cat_features": [
+    "Veh_Usage"
+  ],
+  "tier_encoding": {
+    "High": 0,
+    "Low": 1,
+    "Medium": 2
+  },
+  "agent_context": "Risk_Tier_encoded carries Agent 1 predicted_tier as LabelEncoder ordinal integer",
+  "feature_names": [
+    "Prev_Accidents",
+    "Prev_Citations",
+    "Driving_Exp",
+    "Driver_Age",
+    "Annual_Miles",
+    "Miles_Per_Exp",
+    "Total_Incidents",
+    "Age_Exp_Gap",
+    "Risk_Tier_encoded",
+    "Veh_Usage_Commute",
+    "Veh_Usage_Pleasure"
+  ],
+  "best_hyperparams": {
+    "subsample": 0.9,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.05,
+    "n_estimators": 200,
+    "min_child_weight": 3,
+    "max_depth": 3,
+    "max_delta_step": 0,
+    "learning_rate": 0.05,
+    "gamma": 0.3,
+    "colsample_bytree": 0.8
+  },
+  "artifacts": [
+    "agent2_conversion_model_v2.pkl",
+    "agent2_shap_explainer_v2.pkl",
+    "agent2_ohe_encoder_v2.pkl",
+    "agent2_tier_encoder_v2.pkl",
+    "agent2_feature_names_v2.pkl",
+    "agent2_threshold_v2.pkl"
+  ]
+}

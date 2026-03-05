@@ -29,7 +29,7 @@ import logging
 import shutil
 from pathlib import Path
 from collections import Counter
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 import numpy as np
 import pandas as pd

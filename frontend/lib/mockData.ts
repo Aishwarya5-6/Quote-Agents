@@ -51,7 +51,7 @@ export interface MasterResponse {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Mock payload — copy-paste ready for frontend development.
 //  Replace the fetch call in app/page.tsx with a real POST when the
-//  backend is live at http://localhost:8000/api/process_quote.
+//  backend is live at http://localhost:8001/api/process_quote.
 // ─────────────────────────────────────────────────────────────────────────────
 export const mockMasterResponse: MasterResponse = {
   transaction_id: "123",
