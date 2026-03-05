@@ -2,9 +2,10 @@
 
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Terminal, Sparkles } from "lucide-react";
 import VerdictBadge, { type VerdictVariant } from "./VerdictBadge";
 import SkeletonLoader from "./SkeletonLoader";
+import type { RiskAssessment, ConversionMetrics, AdvisorStrategy, FinalRouting } from "@/lib/api-contract";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  StorytellingCard — wraps each agent's output in a progressive-disclosure
@@ -33,6 +34,13 @@ interface StorytellingCardProps {
   children?: React.ReactNode;
   /** Start with details open? (default: false) */
   defaultOpen?: boolean;
+  /** Agent-specific data for custom reasoning display */
+  agentData?: {
+    riskAssessment?: RiskAssessment | null;
+    conversionMetrics?: ConversionMetrics | null;
+    advisorStrategy?: AdvisorStrategy | null;
+    finalRouting?: FinalRouting | null;
+  };
 }
 
 const AGENT_ACCENT: Record<number, { border: string; header: string; glow: string }> = {
@@ -67,9 +75,115 @@ export default function StorytellingCard({
   summary,
   children,
   defaultOpen = false,
+  agentData,
 }: StorytellingCardProps) {
   const [detailsOpen, setDetailsOpen] = useState(defaultOpen);
   const accent = AGENT_ACCENT[agentIndex] ?? AGENT_ACCENT[0];
+
+  // Generate agent-specific data-driven reasoning
+  const getDataDrivenReason = (): React.ReactNode => {
+    if (!agentData) return null;
+
+    switch (agentIndex) {
+      case 0: // Agent 1: Risk Profiler
+        if (agentData.riskAssessment?.top_shap_drivers?.[0]) {
+          const topDriver = agentData.riskAssessment.top_shap_drivers[0];
+          return (
+            <div className="mt-3 p-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5">
+              <p className="text-xs text-emerald-300 leading-relaxed">
+                Risk level determined by <span className="font-mono text-emerald-200">{topDriver.feature}</span>{" "}
+                <span className="text-emerald-400">({topDriver.direction})</span>
+              </p>
+            </div>
+          );
+        }
+        return (
+          <div className="mt-3 p-3 rounded-lg border border-slate-600/30 bg-slate-800/20">
+            <p className="text-xs text-slate-400 leading-relaxed italic">Finalizing risk assessment criteria...</p>
+          </div>
+        );
+
+      case 1: // Agent 2: Conversion Engine
+        if (agentData.conversionMetrics?.distance_to_conversion !== null && agentData.conversionMetrics?.distance_to_conversion !== undefined) {
+          const distance = agentData.conversionMetrics.distance_to_conversion;
+          const distanceText = distance === 0 
+            ? "Above threshold" 
+            : `${Math.round(distance * 100)}% from the buying threshold`;
+          return (
+            <div className="mt-3 p-3 rounded-lg border border-sky-500/20 bg-sky-500/5">
+              <p className="text-xs text-sky-300 leading-relaxed">
+                Customer is <span className="font-mono text-sky-200">{distanceText}</span>
+              </p>
+            </div>
+          );
+        }
+        return (
+          <div className="mt-3 p-3 rounded-lg border border-slate-600/30 bg-slate-800/20">
+            <p className="text-xs text-slate-400 leading-relaxed italic">Finalizing conversion analysis...</p>
+          </div>
+        );
+
+      case 2: // Agent 3: AI Advisor
+        if (agentData.advisorStrategy?.customer_facing_message) {
+          return (
+            <div className="mt-3 p-4 rounded-lg border border-violet-500/30 bg-violet-500/5 relative">
+              <div className="flex items-start gap-3">
+                <Sparkles className="w-4 h-4 text-violet-400 mt-0.5 shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-xs text-violet-300 leading-relaxed">
+                    {agentData.advisorStrategy.customer_facing_message}
+                  </p>
+                  <p className="text-[10px] text-violet-500/80 mt-2 font-mono">AI-Generated Pricing Logic</p>
+                </div>
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div className="mt-3 p-3 rounded-lg border border-slate-600/30 bg-slate-800/20">
+            <p className="text-xs text-slate-400 leading-relaxed italic">Finalizing premium strategy...</p>
+          </div>
+        );
+
+      case 3: // Agent 4: Underwriting Router
+        if (agentData.finalRouting?.reason) {
+          const routing = agentData.finalRouting.final_routing_decision ?? "MANUAL_REVIEW";
+          const routingColor = routing === "AUTO_APPROVE" ? "text-emerald-400" : routing === "REJECT" ? "text-rose-400" : "text-amber-400";
+          return (
+            <div className="mt-3 rounded-lg border border-slate-700/60 bg-slate-950 overflow-hidden">
+              <div className="flex items-center gap-2 px-3 py-2 bg-slate-900/50 border-b border-slate-800/80">
+                <span className="w-2 h-2 rounded-full bg-rose-500/60" />
+                <span className="w-2 h-2 rounded-full bg-amber-500/60" />
+                <span className="w-2 h-2 rounded-full bg-emerald-500/60" />
+                <span className="ml-2 text-[10px] text-slate-600 tracking-wider font-mono">decision_engine.log</span>
+              </div>
+              <div className="p-3">
+                <div className="flex gap-2 text-xs mb-2">
+                  <span className="text-emerald-500 shrink-0 select-none font-mono">›</span>
+                  <p className="text-slate-400 leading-relaxed font-mono text-[11px]">
+                    {agentData.finalRouting.reason}
+                  </p>
+                </div>
+                <div className="flex gap-2 text-xs">
+                  <span className="text-emerald-500 shrink-0 select-none font-mono">›</span>
+                  <p className="text-slate-600 font-mono text-[11px]">
+                    routing_decision: <span className={routingColor}>{routing}</span>
+                  </p>
+                </div>
+              </div>
+            </div>
+          );
+        }
+        return (
+          <div className="mt-3 p-3 rounded-lg border border-slate-600/30 bg-slate-800/20">
+            <p className="text-xs text-slate-400 leading-relaxed italic">Finalizing decision criteria...</p>
+          </div>
+        );
+
+      default:
+        return null;
+    }
+  };
 
   if (state === "hidden") return null;
 
@@ -121,6 +235,15 @@ export default function StorytellingCard({
                 {summary}
               </motion.p>
             )}
+
+            {/* Data-driven reasoning (only appears after reveal) */}
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3 }}
+            >
+              {getDataDrivenReason()}
+            </motion.div>
           </div>
 
           {/* ── Accordion Toggle ────────────────────────────────────── */}

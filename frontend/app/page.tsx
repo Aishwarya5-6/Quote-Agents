@@ -305,6 +305,7 @@ export default function DashboardPage() {
                 state={cardStates[0]}
                 verdict={riskVerdict?.verdict}
                 summary={riskVerdict?.summary}
+                agentData={{ riskAssessment: data?.risk_assessment }}
               >
                 {data?.risk_assessment && (
                   <RiskDetails data={data.risk_assessment} />
@@ -329,6 +330,7 @@ export default function DashboardPage() {
                 state={cardStates[1]}
                 verdict={conversionVerdict?.verdict}
                 summary={conversionVerdict?.summary}
+                agentData={{ conversionMetrics: data?.conversion_metrics }}
               >
                 {data?.conversion_metrics && (
                   <ConversionDetails data={data.conversion_metrics} />
@@ -353,6 +355,7 @@ export default function DashboardPage() {
                 state={cardStates[2]}
                 verdict={advisorVerdict?.verdict}
                 summary={advisorVerdict?.summary}
+                agentData={{ advisorStrategy: data?.advisor_strategy }}
               >
                 {data?.advisor_strategy && (
                   <AdvisorDetails data={data.advisor_strategy} />
@@ -377,6 +380,7 @@ export default function DashboardPage() {
                 state={cardStates[3]}
                 verdict={decisionVerdict?.verdict}
                 summary={decisionVerdict?.summary}
+                agentData={{ finalRouting: data?.final_routing }}
                 defaultOpen={true}
               >
                 {data?.final_routing && (
