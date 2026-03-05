@@ -120,9 +120,24 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# Build CORS origins: always include localhost for dev, plus any
+# comma-separated production domains from FRONTEND_ORIGINS env var.
+import os as _os
+_cors_extra = [
+    o.strip()
+    for o in _os.environ.get("FRONTEND_ORIGINS", "").split(",")
+    if o.strip()
+]
+_cors_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    *_cors_extra,
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -1,0 +1,17 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  backend/.dockerignore  —  exclude files not needed inside the container
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.env.*
+!.env.example
+.git/
+.gitignore
+.venv/
+venv/
+*.swp
+.DS_Store
+test_pipeline.py
+_ood_debug.py

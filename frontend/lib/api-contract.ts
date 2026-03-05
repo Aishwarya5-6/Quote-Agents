@@ -11,7 +11,8 @@
 //    FinalRouting      ← Agent 4  (Rules + Groq LLM)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const API_BASE = "http://localhost:8001";
+export const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
 
 // ── Enums ────────────────────────────────────────────────────────────────────
 export type RiskTier = "Low" | "Medium" | "High";
