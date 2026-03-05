@@ -147,7 +147,7 @@ PRI_LOW    = "Low"
 ESCALATE_HARD_THRESHOLD    = 30   # below this → always escalate
 ESCALATE_ACCIDENT_THRESHOLD = 50  # accident present AND score below this → escalate
 REJECT_CONVERSION_CEILING  = 20   # High risk + score below this → reject outright
-AUTO_APPROVE_MIN_SCORE     = 45   # minimum score for auto-approval (lowered for reachability)
+AUTO_APPROVE_MIN_SCORE     = 70   # minimum score for auto-approval (strong buying signal required)
 
 
 # ---------------------------------------------------------------------------
@@ -275,12 +275,13 @@ def route_decision(
             f"Prior accident on record with borderline conversion score ({conversion_score:.0f})"
         )
 
-    # Rule E4 — Any citation on a Medium or High risk tier customer.
-    # Citations compound the risk profile and require underwriter judgement
-    # on whether to bind at the quoted terms.
-    if prev_citations > 0 and risk_tier >= RISK_MEDIUM:
+    # Rule E4 — Any citation, regardless of risk tier.
+    # Citations indicate a pattern of traffic violations that compound the
+    # risk profile and always require underwriter judgement on whether to
+    # bind at the quoted terms — even for otherwise low-risk customers.
+    if prev_citations > 0:
         escalation_reasons.append(
-            f"Prior citation with {risk_label} risk tier requires underwriter review"
+            f"Prior citation on record ({prev_citations} citation(s)) requires underwriter review regardless of risk tier"
         )
 
     if escalation_reasons:
