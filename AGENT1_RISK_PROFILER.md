@@ -1,381 +1,581 @@
-# Agent 1 – Risk Profiler
+# Agent 1 – Risk Profiler v3
 ### Auto Insurance Multi-Agent Pipeline
 
-> **Script:** `agent1_risk_profiler.py`
-> **Role in Pipeline:** First agent. Receives a raw quote, assigns a real-time **Risk Tier (Low / Medium / High)**, and returns an explainable prediction to downstream agents.
-> **Date Trained:** March 5, 2026
-> **Dataset:** `Autonomous QUOTE AGENTS.csv` — 146,259 quotes
+> **Status:** ✅ Deployment Ready — 42/42 checks passed (March 5, 2026)
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [Directory Structure](#2-directory-structure)
-3. [Dependencies](#3-dependencies)
-4. [Pipeline Architecture](#4-pipeline-architecture)
-5. [Step-by-Step Breakdown](#5-step-by-step-breakdown)
-   - [Step 1 – Data Loading & Cleaning](#step-1--data-loading--cleaning)
-   - [Step 2 – Risk Tier Label Generation](#step-2--risk-tier-label-generation)
-   - [Step 3 – Feature Engineering](#step-3--feature-engineering)
-   - [Step 4 – Encoding](#step-4--encoding)
-   - [Step 5 – Sample Weights](#step-5--sample-weights)
-   - [Step 6 – Hyperparameter Tuning](#step-6--hyperparameter-tuning)
-   - [Step 7 – Evaluation](#step-7--evaluation)
-   - [Step 8 – SHAP Explainer](#step-8--shap-explainer)
-   - [Step 9 – `explain_risk_prediction()`](#step-9--explain_risk_prediction)
-   - [Step 10 – `RiskProfilerPredictor` Class](#step-10--riskprofilerpreditor-class)
-   - [Step 11 – Artifact Export](#step-11--artifact-export)
-6. [Model Results](#6-model-results)
-7. [Exported Artifacts](#7-exported-artifacts)
-8. [Feature Reference](#8-feature-reference)
-9. [Inference API Reference](#9-inference-api-reference)
-10. [CrewAI Integration Guide](#10-crewai-integration-guide)
-11. [Configuration Constants](#11-configuration-constants)
+2. [Architecture — The Six Layers](#2-architecture--the-six-layers)
+3. [Project Structure](#3-project-structure)
+4. [Prerequisites & Installation](#4-prerequisites--installation)
+5. [Training the Model](#5-training-the-model)
+6. [Model Performance](#6-model-performance)
+7. [Feature Engineering](#7-feature-engineering)
+8. [Safety System](#8-safety-system)
+9. [Artifact Reference](#9-artifact-reference)
+10. [The Production API](#10-the-production-api)
+11. [API Endpoint Reference](#11-api-endpoint-reference)
+12. [Response Contract](#12-response-contract)
+13. [Observability & Drift Monitoring](#13-observability--drift-monitoring)
+14. [Counterfactual What-If Analyzer](#14-counterfactual-what-if-analyzer)
+15. [Configuration Reference](#15-configuration-reference)
+16. [Key Design Decisions](#16-key-design-decisions)
 
 ---
 
 ## 1. Overview
 
-Agent 1 is the **risk classification layer** of the multi-agent quoting pipeline. It takes the six core driver/vehicle features from an insurance quote and outputs:
+Agent 1 is the first stage of a multi-agent insurance quoting pipeline. It receives a raw customer quote and returns a calibrated **Risk Tier** (High / Medium / Low) together with a SHAP explanation, a drift signal, and a counterfactual recommendation — all before any downstream pricing or underwriting agent ever sees the quote.
 
-- A **Risk Tier** label: `Low`, `Medium`, or `High`
-- A **confidence score** (softmax probability of the predicted class)
-- **Per-class probabilities** for all three tiers
-- A **SHAP-based explanation** — the top 3 features that most influenced the specific decision, with direction and magnitude
+**Core technology stack:**
 
-Since the raw dataset does not contain a pre-existing `Risk_Tier` column, the agent generates ground-truth labels using a **domain-weighted actuarial scoring function** before training.
+| Component | Library | Version |
+|---|---|---|
+| Gradient Boosting | XGBoost `XGBClassifier` | 2.1.4 |
+| Probability Calibration | scikit-learn `CalibratedClassifierCV` | 1.6.1 |
+| Anomaly Detection | scikit-learn `IsolationForest` | 1.6.1 |
+| SHAP Explanation | `TreeExplainer` | 0.49.1 |
+| Production API | FastAPI + Uvicorn | latest |
+| Input Validation | Pydantic v2 | 2.12.5 |
+| Python | CPython | 3.9.6 |
 
 ---
 
-## 2. Directory Structure
+## 2. Architecture — The Six Layers
+
+Every prediction passes through six defensive layers in strict order. No layer is skippable.
+
+```
+Incoming Quote (raw dict)
+        │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 0 │ Clean Slate (training only)                        │
+│          │ shutil.rmtree on models/ and data/processed/       │
+│          │ Prevents stale artifact contamination              │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼ (inference path)
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 1 │ Pydantic Gateway  (app.py — API layer only)        │
+│          │ QuoteRequest schema: type checks, range bounds,    │
+│          │ Literal Veh_Usage enum, cross-field validator      │
+│          │ FAIL → HTTP 422 Unprocessable Entity               │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 2 │ Deterministic Physics Check                        │
+│          │ Hardcoded domain rules — no ML needed:             │
+│          │   • Driver_Age < 16                                │
+│          │   • Annual_Miles < 0                               │
+│          │   • Prev_Accidents < 0 or Prev_Citations < 0       │
+│          │   • Driving_Exp > (Driver_Age − 15)                │
+│          │ FAIL → {"status": "ACTION_REQUIRED: DATA_ANOMALY"} │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 3 │ IsolationForest OOD Gate                           │
+│          │ Trained on 8 raw features (no interaction feats)   │
+│          │ Threshold: 0.01th percentile of training scores    │
+│          │ FAIL → {"status": "ACTION_REQUIRED: DATA_ANOMALY"} │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 4 │ XGBoost Prediction + SHAP                          │
+│          │ 11 features (5 raw + 3 interaction + 3 OHE)        │
+│          │ CalibratedClassifierCV(isotonic, prefit)           │
+│          │ High=3× · Medium=2× cost-sensitive weights         │
+│          │ TreeExplainer → Top-3 SHAP drivers                 │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼
+┌───────────────────────────────────────────────────────────────┐
+│  Layer 5 │ Confidence Gate  (API layer only)                  │
+│          │ If max(class_probability) < 0.60:                  │
+│          │   status → "LOW_CONFIDENCE_ESCALATE"               │
+│          │ Prediction still returned for reviewer context     │
+└──────────────────────────────┬────────────────────────────────┘
+                               │
+        ▼
+   Final Response JSON
+```
+
+---
+
+## 3. Project Structure
 
 ```
 Quote-Agents/
-├── Autonomous QUOTE AGENTS.csv     ← Raw dataset (146,259 rows)
-├── agent1_risk_profiler.py         ← This script (training + inference)
-├── AGENT1_RISK_PROFILER.md         ← This documentation
-└── models/                         ← All exported artifacts
-    ├── xgb_risk_profiler.pkl       ← Trained XGBClassifier
-    ├── shap_explainer.pkl          ← SHAP TreeExplainer
-    ├── ohe_encoder.pkl             ← OneHotEncoder (Veh_Usage)
-    ├── label_encoder.pkl           ← LabelEncoder (Risk Tier ↔ int)
-    ├── feature_names.pkl           ← Ordered feature list (14 features)
-    └── manifest.json               ← Human-readable artifact manifest
+├── agents/
+│   └── agent1_risk_profiler.py     ← Full training + inference script
+├── app.py                          ← FastAPI production service
+├── data/
+│   ├── raw/
+│   │   └── insurance_data.csv      ← 146,259 row source dataset (25 cols)
+│   └── processed/
+│       └── cleaned_agent1_data.csv ← 146,259 rows, 11 features + Risk_Tier
+├── models/                         ← 8 serialised artifacts (auto-generated)
+│   ├── calibrated_risk_profiler.pkl
+│   ├── shap_explainer.pkl
+│   ├── ohe_encoder.pkl
+│   ├── label_encoder.pkl
+│   ├── feature_names.pkl
+│   ├── ood_detector.pkl
+│   ├── ood_threshold.pkl
+│   ├── training_stats.pkl
+│   └── manifest.json
+├── AGENT1_RISK_PROFILER.md         ← This file
+└── .venv/                          ← Python virtual environment
 ```
 
 ---
 
-## 3. Dependencies
+## 4. Prerequisites & Installation
 
-| Package | Version Used | Purpose |
-|---|---|---|
-| `pandas` | 2.3.3 | Data loading, manipulation, feature engineering |
-| `numpy` | — | Numerical operations, sample weight arrays |
-| `xgboost` | 2.1.4 | Core gradient boosting classifier |
-| `scikit-learn` | 1.6.1 | Encoding, splitting, cross-validation, metrics |
-| `shap` | 0.49.1 | SHAP TreeExplainer for prediction explainability |
-| `joblib` | — | Serialization of all model artifacts |
+### System requirements
 
-> **macOS note:** XGBoost requires OpenMP. Install it with `brew install libomp` before running the script.
+- macOS (Apple Silicon or Intel) — tested on macOS with Apple M-series
+- Python 3.9.6
+- `libomp` (required by XGBoost on macOS): `brew install libomp`
 
-Install all Python dependencies:
+### Environment setup
+
 ```bash
-pip install pandas numpy xgboost scikit-learn shap joblib
+# From the project root
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install xgboost scikit-learn shap pandas numpy joblib \
+            fastapi "uvicorn[standard]" pydantic
 ```
+
+### Required data file
+
+Place the raw dataset at:
+```
+data/raw/insurance_data.csv
+```
+Expected: **146,259 rows × 25 columns** including `Prev_Accidents`, `Prev_Citations`,
+`Driving_Exp`, `Driver_Age`, `Annual_Miles_Range`, `Veh_Usage`.
 
 ---
 
-## 4. Pipeline Architecture
+## 5. Training the Model
 
-```
-CSV Dataset
-    │
-    ▼
-load_and_prepare_data()        ← Step 1: load, map miles range → numeric, fill nulls
-    │
-    ▼
-assign_risk_tier()             ← Step 2: generate Risk_Tier labels (actuarial scoring)
-    │
-    ▼
-engineer_features()            ← Step 3: create 6 new interaction/ratio features
-    │
-    ▼
-encode_features()              ← Step 4: OHE for Veh_Usage, LabelEncode target
-    │
-    ▼
-compute_sample_weights()       ← Step 5: inverse-frequency weights for imbalance
-    │
-    ▼
-train_model()                  ← Step 6: RandomizedSearchCV (50 iter, 5-fold StratKFold)
-    │
-    ▼
-evaluate_model()               ← Step 7: classification report + confusion matrix
-    │
-    ▼
-build_shap_explainer()         ← Step 8: TreeExplainer (interventional, 500-row BG)
-    │
-    ▼
-export_artifacts()             ← Step 11: save .pkl + manifest.json to ./models/
-    │
-    ▼
-RiskProfilerPredictor          ← Step 10: CrewAI-ready inference wrapper
+Run the full training pipeline with one command:
+
+```bash
+cd /path/to/Quote-Agents
+.venv/bin/python agents/agent1_risk_profiler.py
 ```
 
----
+**What happens during training (in order):**
 
-## 5. Step-by-Step Breakdown
-
-### Step 1 – Data Loading & Cleaning
-
-**Function:** `load_and_prepare_data(path)`
-
-The raw dataset uses range strings for annual mileage (e.g. `"> 25 K & <= 35 K"`). These are mapped to numeric midpoint values for use in calculations:
-
-| Range String | Midpoint Used |
+| Step | Action |
 |---|---|
-| `<= 7.5 K` | 7,500 |
-| `> 7.5 K & <= 15 K` | 11,250 |
-| `> 15 K & <= 25 K` | 20,000 |
-| `> 25 K & <= 35 K` | 30,000 |
-| `> 35 K & <= 45 K` | 40,000 |
-| `> 45 K & <= 55 K` | 50,000 |
-| `> 55 K` | 62,500 |
+| 0 | `shutil.rmtree` wipes `models/` and `data/processed/` entirely |
+| 1 | Load CSV, map mileage ranges to numeric midpoints, fill nulls |
+| 2 | Generate noisy Risk_Tier labels (Gaussian noise σ=2.0 on actuarial score) |
+| 3a | Add 3 interaction features (`Miles_Per_Exp`, `Total_Incidents`, `Age_Exp_Gap`) |
+| 3b | OneHotEncode `Veh_Usage` → 11-column feature matrix |
+| 4 | Three-way stratified split: 64% subtrain / 16% calibration / 20% test |
+| 4a | Train `IsolationForest` on 8 raw features; compute 0.01th-pct threshold |
+| 4a+ | Capture `training_stats` (feature means) for drift monitoring |
+| 4b | Compute cost-sensitive sample weights (High=3×, Medium=2×, Low=1×) |
+| 5 | `RandomizedSearchCV` — 50 iterations, 5-fold StratifiedKFold, `neg_log_loss` |
+| 6 | `CalibratedClassifierCV(isotonic, prefit)` on calibration split |
+| 7 | Evaluate on held-out test set (accuracy, balanced accuracy, log-loss, F1) |
+| 8 | Build SHAP `TreeExplainer` on base `XGBClassifier` (500-row background) |
+| 9a | Demo predictions through the full pipeline |
+| 9b | Adversarial red-team test on 5 impossible profiles |
+| 11 | Export 8 artifacts + manifest.json + processed CSV |
 
-**Null handling strategy:**
-- All numeric columns: coerce to numeric, fill nulls with **column median** (robust to outliers)
-- `Veh_Usage` (categorical): fill nulls with `"Commute"` (most common value)
-
----
-
-### Step 2 – Risk Tier Label Generation
-
-**Functions:** `_score_row(row)` → `assign_risk_tier(row)`
-
-Since no `Risk_Tier` column exists in the raw data, ground-truth labels are generated using a **weighted actuarial scoring model** inspired by auto-insurance loss-ratio research.
-
-#### Scoring Weights
-
-| Factor | Condition | Points |
-|---|---|---|
-| Prior accident | `Prev_Accidents = 1` | **+4** |
-| Prior citation | `Prev_Citations = 1` | **+2** |
-| Driving experience | ≤ 3 years | **+3** |
-| Driving experience | ≤ 7 years | **+2** |
-| Driving experience | ≤ 15 years | **+1** |
-| Driver age | < 22 years | **+2** |
-| Driver age | < 26 years | **+1** |
-| Annual mileage | > 45,000 mi/yr | **+2** |
-| Annual mileage | > 25,000 mi/yr | **+1** |
-| Vehicle usage | `Business` | **+1** |
-
-#### Tier Thresholds
-
-| Score | Risk Tier | Rationale |
-|---|---|---|
-| ≥ 7 | **High** | ≥2 major risk factors, or 1 incident + aggravating conditions |
-| ≥ 4 | **Medium** | 1 moderate risk factor, or compounding exposure |
-| < 4 | **Low** | Clean record, experienced, low-exposure driver |
-
-#### Dataset Distribution (146,259 rows)
-
-| Tier | Count | Share |
-|---|---|---|
-| Low | 111,223 | 76.0% |
-| Medium | 28,531 | 19.5% |
-| High | 6,505 | 4.4% |
-
-> The dataset is **significantly imbalanced** — this is handled via inverse-frequency sample weights in Step 5.
+**Expected runtime:** ~4 minutes on Apple M-series CPU (250 total fits).
 
 ---
 
-### Step 3 – Feature Engineering
+## 6. Model Performance
 
-**Function:** `engineer_features(df)`
+> Results from the last training run — March 5, 2026.
 
-Six new features are created to expose non-linear interactions and risk ratios that the base columns alone cannot express:
+### Overall metrics
 
-| Feature | Formula | Rationale |
-|---|---|---|
-| `Total_Incidents` | `Prev_Accidents + Prev_Citations` | Simple incident count; useful as standalone and interaction base |
-| `Incident_Score` | `Prev_Accidents × 2 + Prev_Citations` | Actuarially weighted severity: accidents 2× more costly than citations |
-| `Miles_Per_Exp_Year` | `Annual_Miles / (Driving_Exp + 1)` | Exposure-normalised driving load; high value = high-risk lifestyle |
-| `Risk_Exposure_Index` | `(Incident_Score + 1) × Annual_Miles / (Driving_Exp + 1)` | Compound effect of bad record × heavy use × novice driver |
-| `Young_Inexperienced` | `1 if (Driver_Age < 25 AND Driving_Exp < 5) else 0` | Binary flag for high-claim teen/early-adult novice drivers |
-| `Age_Exp_Gap` | `Driver_Age - Driving_Exp - 16` | Deviation from expected experience at age (US licensing age = 16); positive gap → late start or suspended licence |
-
----
-
-### Step 4 – Encoding
-
-**Function:** `encode_features(df, engineered, fit, ohe, le)`
-
-| Column | Treatment | Notes |
-|---|---|---|
-| `Veh_Usage` | **One-Hot Encoding** | Produces: `Veh_Usage_Business`, `Veh_Usage_Commute`, `Veh_Usage_Pleasure`. `handle_unknown="ignore"` for safe inference on unseen categories. |
-| `Risk_Tier` | **Label Encoding** | `High=0, Low=1, Medium=2` (alphabetical) |
-
-The function accepts `fit=False` + pre-fitted encoders to safely transform new inference data without re-fitting.
-
-**Final feature set (14 features):**
-```
-Prev_Accidents, Prev_Citations, Driving_Exp, Driver_Age, Annual_Miles,
-Total_Incidents, Incident_Score, Miles_Per_Exp_Year, Risk_Exposure_Index,
-Young_Inexperienced, Age_Exp_Gap,
-Veh_Usage_Business, Veh_Usage_Commute, Veh_Usage_Pleasure
-```
-
----
-
-### Step 5 – Sample Weights
-
-**Function:** `compute_sample_weights(y)`
-
-Because the dataset is highly imbalanced (76% Low, 19.5% Medium, 4.4% High), each training sample is assigned an **inverse-frequency weight**:
-
-$$w_c = \frac{N}{K \times n_c}$$
-
-Where $N$ = total samples, $K$ = number of classes, $n_c$ = samples in class $c$.
-
-This ensures the model treats every Risk Tier as equally important, preventing it from ignoring the rare `High` class.
-
-**Resulting weight range:** `0.4383 – 7.4947`
-
----
-
-### Step 6 – Hyperparameter Tuning
-
-**Function:** `train_model(X_train, y_train, n_classes, sample_weights, n_iter=50)`
-
-**Search strategy:** `RandomizedSearchCV` — samples 50 random parameter combinations, each evaluated with **5-fold StratifiedKFold** cross-validation (stratification preserves Risk Tier ratios in every fold).
-
-**Search space:**
-
-| Parameter | Values Searched | Role |
-|---|---|---|
-| `n_estimators` | 200, 300, 400, 500, 600 | Number of boosting rounds |
-| `max_depth` | 4, 5, 6, 7, 8 | Tree depth (complexity vs. overfit) |
-| `learning_rate` | 0.01, 0.05, 0.08, 0.10, 0.15, 0.20 | Shrinkage per step |
-| `subsample` | 0.70, 0.80, 0.90, 1.00 | Row sub-sampling per tree |
-| `colsample_bytree` | 0.70, 0.80, 0.90, 1.00 | Feature sub-sampling per tree |
-| `min_child_weight` | 1, 3, 5, 7 | Min sum of instance weights in a leaf |
-| `gamma` | 0, 0.05, 0.10, 0.20, 0.30 | Min loss reduction for a split |
-| `reg_alpha` | 0, 0.01, 0.05, 0.10, 0.50 | L1 regularisation |
-| `reg_lambda` | 0.5, 1.0, 1.5, 2.0, 3.0 | L2 regularisation |
-| `max_delta_step` | 0, 1, 5 | Convergence aid for imbalanced data |
-
-**Fixed settings:** `objective="multi:softprob"`, `eval_metric="mlogloss"`, `tree_method="hist"`, `device="cpu"`
-
-**Best parameters found:**
-```json
-{
-    "subsample": 1.0,
-    "reg_lambda": 1.0,
-    "reg_alpha": 0,
-    "n_estimators": 500,
-    "min_child_weight": 1,
-    "max_depth": 8,
-    "max_delta_step": 0,
-    "learning_rate": 0.08,
-    "gamma": 0,
-    "colsample_bytree": 1.0
-}
-```
-
-**Search time:** ~195 seconds (250 total fits: 50 candidates × 5 folds)
-
----
-
-### Step 7 – Evaluation
-
-**Function:** `evaluate_model(model, X_test, y_test, le)`
-
-**Train/test split:** 80% train (117,007 rows) / 20% test (29,252 rows), stratified.
-
-#### Results on Held-Out Test Set
-
-| Metric | Score |
+| Metric | Value |
 |---|---|
-| **Test Accuracy** | **100.00%** |
-| **Balanced Accuracy** | **100.00%** |
+| **Test Accuracy** | **79.10%** |
+| **Balanced Accuracy** | 55.02% |
+| **Log-Loss (calibrated)** | **0.4944** |
+| **Training set size** | 93,605 rows |
+| **Calibration set size** | 23,402 rows |
+| **Test set size** | 29,252 rows |
+
+### Per-class performance
 
 | Class | Precision | Recall | F1-Score | Support |
 |---|---|---|---|---|
-| High | 1.0000 | 1.0000 | 1.0000 | 1,301 |
-| Low | 1.0000 | 1.0000 | 1.0000 | 22,245 |
-| Medium | 1.0000 | 1.0000 | 1.0000 | 5,706 |
+| **High** | 0.470 | **0.651** | 0.546 | 1,763 |
+| **Low** | 0.821 | **0.987** | 0.897 | 22,211 |
+| **Medium** | 0.575 | 0.012 | 0.024 | 5,278 |
+| *macro avg* | 0.622 | 0.550 | 0.489 | 29,252 |
+| *weighted avg* | 0.756 | 0.791 | 0.718 | 29,252 |
 
-**Confusion Matrix:**
+### Confusion matrix
 
-| | Pred: High | Pred: Low | Pred: Medium |
-|---|---|---|---|
-| **Actual: High** | 1,301 | 0 | 0 |
-| **Actual: Low** | 0 | 22,245 | 0 |
-| **Actual: Medium** | 0 | 0 | 5,706 |
-
-> **Note on 100% accuracy:** The labels were generated by a deterministic scoring function applied to the same feature columns the model trains on. XGBoost with sufficient depth can perfectly learn this deterministic mapping, making 100% accuracy on both train and test expected and valid. In production, if real-world claim outcomes are available, retraining on those labels is recommended.
-
----
-
-### Step 8 – SHAP Explainer
-
-**Function:** `build_shap_explainer(model, X_background)`
-
-- **Method:** `shap.TreeExplainer` with `feature_perturbation="interventional"`
-- **Background dataset:** Random sample of 500 training rows (capped for inference speed)
-- **Output shape:** `(n_samples, n_features, n_classes)` — one SHAP value per feature per class per sample
-
-Interventional perturbation breaks feature dependencies by marginalising over the background distribution, producing causally-interpretable SHAP values rather than correlation-driven ones.
-
----
-
-### Step 9 – `explain_risk_prediction()`
-
-**Signature:**
-```python
-explain_risk_prediction(
-    quote_data: Dict[str, Any],
-    *,
-    model, explainer, ohe, le, feature_names, engineered_features
-) -> Dict[str, Any]
+```
+                Predicted
+Actual    High    Low   Medium
+High      1148    590       25
+Low        263  21925       23
+Medium    1032   4181       65
 ```
 
-**Input `quote_data` keys:**
+### Best hyperparameters
 
-| Key | Type | Description |
+Found by `RandomizedSearchCV(n_iter=50, scoring="neg_log_loss", cv=StratifiedKFold(5))`.
+
+| Parameter | Value |
+|---|---|
+| `n_estimators` | 300 |
+| `max_depth` | 7 |
+| `learning_rate` | 0.01 |
+| `subsample` | 0.8 |
+| `colsample_bytree` | 1.0 |
+| `min_child_weight` | 5 |
+| `gamma` | 0.3 |
+| `reg_alpha` | 0.1 |
+| `reg_lambda` | 1.5 |
+| `max_delta_step` | 1 |
+
+### Label distribution (training data)
+
+| Class | Count | % |
 |---|---|---|
-| `Prev_Accidents` | `int` | 0 or 1 — prior accident on record |
-| `Prev_Citations` | `int` | 0 or 1 — prior traffic citation on record |
-| `Driving_Exp` | `int` | Years of licensed driving experience |
-| `Driver_Age` | `int` | Driver's age in years |
-| `Annual_Miles` | `int` | Estimated annual mileage (**numeric**, not a range string) |
-| `Veh_Usage` | `str` | `"Commute"` \| `"Pleasure"` \| `"Business"` |
+| Low | 111,057 | 75.9% |
+| Medium | 26,388 | 18.0% |
+| High | 8,814 | 6.0% |
 
-**Output dictionary:**
+---
 
-| Key | Type | Description |
+## 7. Feature Engineering
+
+### Raw input features (6)
+
+These are the fields a caller must supply:
+
+| Feature | Type | Description |
 |---|---|---|
-| `predicted_tier` | `str` | `"Low"`, `"Medium"`, or `"High"` |
-| `predicted_class_id` | `int` | Encoded class index (0=High, 1=Low, 2=Medium) |
-| `confidence` | `float` | Softmax probability of the predicted class (0.0–1.0) |
-| `class_probabilities` | `dict` | `{"High": p, "Low": p, "Medium": p}` for all 3 classes |
-| `top_3_features` | `list` | Top 3 SHAP-ranked features (see structure below) |
-| `all_shap_values` | `dict` | `{feature: shap_value}` for all 14 features |
+| `Prev_Accidents` | int | Prior at-fault accidents |
+| `Prev_Citations` | int | Prior traffic citations |
+| `Driving_Exp` | int | Years of driving experience |
+| `Driver_Age` | int | Age in years |
+| `Annual_Miles` | int | Estimated annual mileage |
+| `Veh_Usage` | str | `"Business"`, `"Commute"`, or `"Pleasure"` |
 
-**`top_3_features` item structure:**
+### Interaction features (3) — computed automatically
 
+These are derived at inference time from the raw inputs. The caller never supplies them.
+
+| Feature | Formula | Actuarial Meaning |
+|---|---|---|
+| `Miles_Per_Exp` | `Annual_Miles / (Driving_Exp + 1)` | Exposure density — high miles with low experience signals elevated risk |
+| `Total_Incidents` | `Prev_Accidents + Prev_Citations` | Combined incident load — single number capturing overall record severity |
+| `Age_Exp_Gap` | `Driver_Age − Driving_Exp − 16` | Delayed licensing signal — gap between legal driving age and when the driver actually started |
+
+### One-Hot Encoded feature (3 columns)
+
+`Veh_Usage` is expanded into three binary columns by `OneHotEncoder(sparse_output=False, handle_unknown="ignore")`:
+
+- `Veh_Usage_Business`
+- `Veh_Usage_Commute`
+- `Veh_Usage_Pleasure`
+
+### Full feature vector (11 columns in model order)
+
+```python
+["Prev_Accidents", "Prev_Citations", "Driving_Exp", "Driver_Age", "Annual_Miles",
+ "Miles_Per_Exp", "Total_Incidents", "Age_Exp_Gap",
+ "Veh_Usage_Business", "Veh_Usage_Commute", "Veh_Usage_Pleasure"]
+```
+
+### Label generation (training only)
+
+Labels are **not read from the CSV**. They are generated synthetically to prevent data leakage from a deterministic formula:
+
+1. Compute a deterministic actuarial score from the 6 raw features.
+2. Add Gaussian noise: `score += rng.normal(0.0, σ=2.0)`.
+3. Bucket into tiers: High (score ≥ 7), Medium (score ≥ 4), Low (score < 4).
+
+The noise forces the model to learn probability distributions rather than memorising a formula.
+
+---
+
+## 8. Safety System
+
+### Layer 2 — Deterministic Physics Check
+
+Applied **before** any ML scoring. Rejects inputs that violate physical or legal constraints:
+
+```python
+if Driver_Age < 16:            → BLOCKED  # below legal driving age
+if Annual_Miles < 0:           → BLOCKED  # negative mileage impossible
+if Prev_Accidents < 0:         → BLOCKED  # negative count impossible
+if Prev_Citations < 0:         → BLOCKED  # negative count impossible
+if Driving_Exp > (Driver_Age - 15): → BLOCKED  # more exp than lifetime allows
+```
+
+Return:
 ```json
 {
-  "feature":    "Risk_Exposure_Index",
-  "shap_value": 3.9642,
-  "direction":  "↑ increases risk",
-  "magnitude":  "HIGH"
+  "status": "ACTION_REQUIRED: DATA_ANOMALY",
+  "message": "Deterministic Physics Check Failed: Logically impossible driver inputs detected. Driver_Age=-5.0 < 16 (below legal driving age)"
 }
 ```
 
-**Magnitude thresholds:**
+### Layer 3 — IsolationForest OOD Gate
 
-| Magnitude | Condition |
+- Trained on **8 raw features only** (5 numeric + 3 OHE columns from `Veh_Usage`).
+- Interaction features are **excluded** from OOD training — extreme values like `Miles_Per_Exp = 9,999,999 / 1` saturate tree-path depth and make corrupt data appear normal.
+- Threshold: **0.01th percentile** of training anomaly scores = `−0.710535`.
+- Only quotes whose score falls below 99.99% of all training quotes are blocked.
+
+```
+Normal quote  → score > −0.710535 → passes to XGBoost
+Anomaly quote → score < −0.710535 → blocked, returns OOD_FLAG
+```
+
+### Adversarial Red-Team Test
+
+Runs automatically at the end of every training run. Tests 5 adversarial profiles:
+
+| Profile | Attack Type |
+|---|---|
+| `age=18, exp=40` | Impossible experience for age |
+| `Annual_Miles=−500` | Negative mileage |
+| `age=−5, miles=9,999,999` | Data entry corruption |
+| `Driver_Age=0` | Pre-birth driver |
+| `Prev_Accidents=−3` | Negative incident count |
+
+The Physics Check (Layer 2) handles sign violations and impossible age/experience gaps.
+The IsolationForest (Layer 3) handles statistically extreme outliers.
+
+---
+
+## 9. Artifact Reference
+
+All 8 artifacts are written to `models/` on every training run. The directory is wiped first, so no stale files can persist.
+
+| File | Size | Contents |
+|---|---|---|
+| `calibrated_risk_profiler.pkl` | 2.2 MB | `CalibratedClassifierCV` wrapping the best `XGBClassifier` |
+| `shap_explainer.pkl` | 4.1 MB | `TreeExplainer` bound to the base `XGBClassifier` |
+| `ohe_encoder.pkl` | < 1 KB | Fitted `OneHotEncoder` for `Veh_Usage` |
+| `label_encoder.pkl` | < 1 KB | Fitted `LabelEncoder` mapping High/Low/Medium ↔ 0/1/2 |
+| `feature_names.pkl` | < 1 KB | Ordered list of 11 feature names |
+| `ood_detector.pkl` | 951 KB | Fitted `IsolationForest(n_estimators=200)` |
+| `ood_threshold.pkl` | < 1 KB | Float: `−0.710535` (0.01th percentile of training scores) |
+| `training_stats.pkl` | < 1 KB | Feature means dict for drift monitoring |
+| `manifest.json` | 1.5 KB | Human-readable pipeline record — version, params, artifact list |
+
+### Loading artifacts (Python)
+
+```python
+from agents.agent1_risk_profiler import RiskProfilerPredictor
+
+predictor = RiskProfilerPredictor.from_artifacts("models/")
+result    = predictor.predict_and_explain({
+    "Driver_Age": 30, "Driving_Exp": 8,
+    "Prev_Accidents": 0, "Prev_Citations": 1,
+    "Annual_Miles": 28_000, "Veh_Usage": "Commute",
+})
+```
+
+---
+
+## 10. The Production API
+
+`app.py` wraps the predictor in a FastAPI service with full defensive programming.
+
+### Starting the server
+
+```bash
+# Requires models/ to be populated first (run the training script once)
+cd /path/to/Quote-Agents
+
+# Production
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+# Development (auto-reload)
+uvicorn app:app --reload --port 8000
+
+# Or directly
+.venv/bin/python app.py
+```
+
+The server loads all 8 artifacts once at startup via FastAPI's `lifespan` context manager. Artifact loading happens **once** — all requests share the same singleton predictor.
+
+### Interactive API docs
+
+Once running, visit:
+- **Swagger UI:** `http://localhost:8000/docs`
+- **ReDoc:** `http://localhost:8000/redoc`
+
+---
+
+## 11. API Endpoint Reference
+
+### `GET /health`
+
+Returns model version and artifact inventory from `manifest.json`.
+
+**Response (200 OK):**
+```json
+{
+  "status": "OK",
+  "agent": "Agent 1 – Risk Profiler v3",
+  "model_type": "CalibratedClassifierCV(isotonic, cv=prefit) → XGBClassifier",
+  "n_features": 11,
+  "classes": ["High", "Low", "Medium"],
+  "ood_detector": "IsolationForest(n_estimators=200)",
+  "artifacts": ["calibrated_risk_profiler.pkl", "..."]
+}
+```
+
+**Response (503):** `manifest.json` not found — training script has not been run.
+
+---
+
+### `POST /predict/risk`
+
+Full five-layer inference pipeline.
+
+**Request body (`QuoteRequest`):**
+
+```json
+{
+  "Driver_Age":     30,
+  "Driving_Exp":     8,
+  "Prev_Accidents":  0,
+  "Prev_Citations":  1,
+  "Annual_Miles":  28000,
+  "Veh_Usage":    "Commute"
+}
+```
+
+**Field constraints (Pydantic v2):**
+
+| Field | Type | Constraint |
+|---|---|---|
+| `Driver_Age` | `int` | `16 ≤ age ≤ 100` |
+| `Driving_Exp` | `int` | `0 ≤ exp ≤ 84` and `exp ≤ Driver_Age − 16` |
+| `Prev_Accidents` | `int` | `0 ≤ value ≤ 20` |
+| `Prev_Citations` | `int` | `0 ≤ value ≤ 20` |
+| `Annual_Miles` | `int` | `0 ≤ value ≤ 200,000` |
+| `Veh_Usage` | `Literal` | `"Business"`, `"Commute"`, or `"Pleasure"` |
+
+**Validation failure (422 Unprocessable Entity):**
+```json
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": ["body", "Driving_Exp"],
+      "msg": "Value error, Driving_Exp (40) cannot exceed Driver_Age − 16 = 1."
+    }
+  ]
+}
+```
+
+---
+
+## 12. Response Contract
+
+### Status values
+
+| `status` | Meaning | HTTP Code |
+|---|---|---|
+| `OK` | Normal prediction — confidence ≥ 0.60 | 200 |
+| `LOW_CONFIDENCE_ESCALATE` | Prediction returned but confidence < 0.60 — route to human underwriter | 200 |
+| `ACTION_REQUIRED: DATA_ANOMALY_ESCALATE` | Physics Check or IsolationForest blocked the input | 422 |
+| `ERROR` | Unhandled server exception | 500 |
+
+### Success response (`OK` or `LOW_CONFIDENCE_ESCALATE`)
+
+```json
+{
+  "status": "OK",
+  "predicted_tier": "Low",
+  "confidence": 0.9444,
+  "class_probabilities": {
+    "High": 0.0001,
+    "Low":  0.9444,
+    "Medium": 0.0554
+  },
+  "top_3_features": [
+    {
+      "feature":    "Driving_Exp",
+      "shap_value": 0.3561,
+      "direction":  "↑ increases risk",
+      "magnitude":  "HIGH"
+    },
+    {
+      "feature":    "Annual_Miles",
+      "shap_value": 0.2025,
+      "direction":  "↑ increases risk",
+      "magnitude":  "HIGH"
+    },
+    {
+      "feature":    "Total_Incidents",
+      "shap_value": 0.1432,
+      "direction":  "↑ increases risk",
+      "magnitude":  "MEDIUM"
+    }
+  ],
+  "escalation_reason": null,
+  "dashboard_metrics": {
+    "drift_status": {
+      "status":        "OK: NO_DRIFT_DETECTED",
+      "feature":       "Annual_Miles",
+      "training_mean": 23269.07,
+      "incoming_mean": 28000.0,
+      "pct_shift_pct": 20.33,
+      "n_samples":     1
+    },
+    "counterfactual_advice": null
+  }
+}
+```
+
+### Low-confidence response
+
+```json
+{
+  "status": "LOW_CONFIDENCE_ESCALATE",
+  "predicted_tier": "Medium",
+  "confidence": 0.4821,
+  "escalation_reason": "Model confidence 48.2% is below the 60% threshold. This is a borderline case — route to a human underwriter for manual review.",
+  "dashboard_metrics": { "..." }
+}
+```
+
+### OOD / anomaly response (422)
+
+```json
+{
+  "status":  "ACTION_REQUIRED: DATA_ANOMALY_ESCALATE",
+  "message": "Deterministic Physics Check Failed: Logically impossible driver inputs detected. Driver_Age=-5.0 < 16 (below legal driving age)",
+  "input":   { "Driver_Age": -5, "..." }
+}
+```
+
+### SHAP magnitude guide
+
+| `magnitude` | Condition |
 |---|---|
 | `HIGH` | `|SHAP| > 0.15` |
 | `MEDIUM` | `0.05 < |SHAP| ≤ 0.15` |
@@ -383,242 +583,147 @@ explain_risk_prediction(
 
 ---
 
-### Step 10 – `RiskProfilerPredictor` Class
+## 13. Observability & Drift Monitoring
 
-A self-contained wrapper that loads all `.pkl` artifacts from disk and exposes a single clean inference method — designed for drop-in use as a **CrewAI custom tool**.
+`calculate_feature_drift(incoming_batch, training_stats)` monitors the `Annual_Miles` distribution of live traffic against the training baseline.
 
-```python
-class RiskProfilerPredictor:
-    @classmethod
-    def from_artifacts(cls, model_dir: str = "./models/") -> "RiskProfilerPredictor"
-    def predict_and_explain(self, quote_data: Dict[str, Any]) -> Dict[str, Any]
-```
+**Reference baseline (from training):**
 
-Internally reconstructs all 6 engineered features from the raw input dict, applies the saved OHE encoder, assembles the 14-feature vector in the exact training order, and calls `explain_risk_prediction()`.
-
----
-
-### Step 11 – Artifact Export
-
-**Function:** `export_artifacts(model, explainer, ohe, le, feature_names, model_dir)`
-
-All objects are serialized with `joblib.dump(obj, path, compress=3)` (zlib level-3 compression — good balance of size vs. speed).
-
----
-
-## 6. Model Results
-
-| Metric | Value |
+| Feature | Training Mean |
 |---|---|
-| Best CV Accuracy (5-fold) | **1.0000** |
-| Test Accuracy | **100.00%** |
-| Balanced Accuracy | **100.00%** |
-| Search Duration | ~195 seconds |
-| Search Candidates | 50 iterations × 5 folds = 250 fits |
-| Training Rows | 117,007 |
-| Test Rows | 29,252 |
+| `Annual_Miles` | 23,269 mi/yr |
+| `Driver_Age` | 41.51 yrs |
+| `Driving_Exp` | 24.51 yrs |
+| `Prev_Accidents` | 0.111 |
+| `Prev_Citations` | 0.111 |
 
-### Demo Predictions
+**Alert logic:**
 
-**Customer 1 — High Risk** *(accident + citation, young, business use)*
 ```
-Predicted Tier  : High
-Confidence      : 100.00%
-Top 3 Drivers:
-  • Total_Incidents       SHAP = +4.7667  [↑ increases risk]  [HIGH]
-  • Risk_Exposure_Index   SHAP = +3.9642  [↑ increases risk]  [HIGH]
-  • Driving_Exp           SHAP = +3.6475  [↑ increases risk]  [HIGH]
+|  (incoming_mean - training_mean) / training_mean  | > 10%
+    → status: "SYSTEM_ALERT: DATA_DRIFT_DETECTED"
 ```
 
-**Customer 2 — Low Risk** *(clean record, 20 yrs experience, pleasure driver)*
-```
-Predicted Tier  : Low
-Confidence      : 100.00%
-Top 3 Drivers:
-  • Driving_Exp           SHAP = +1.6854  [↑ increases risk]  [HIGH]
-  • Prev_Accidents        SHAP = +1.1204  [↑ increases risk]  [HIGH]
-  • Risk_Exposure_Index   SHAP = +0.9851  [↑ increases risk]  [HIGH]
-```
+**Drift response fields:**
 
-**Customer 3 — Medium Risk** *(one citation, commuter, moderate mileage)*
-```
-Predicted Tier  : Medium
-Confidence      : 100.00%
-Top 3 Drivers:
-  • Risk_Exposure_Index   SHAP = +3.7997  [↑ increases risk]  [HIGH]
-  • Total_Incidents       SHAP = +3.1529  [↑ increases risk]  [HIGH]
-  • Driving_Exp           SHAP = +0.7892  [↑ increases risk]  [HIGH]
-```
-
----
-
-## 7. Exported Artifacts
-
-All files are saved to `./models/`:
-
-| File | Size | Description |
-|---|---|---|
-| `xgb_risk_profiler.pkl` | 796 KB | Trained `XGBClassifier` (best params from RandomizedSearch) |
-| `shap_explainer.pkl` | 1.5 MB | `shap.TreeExplainer` bound to the model + background data |
-| `ohe_encoder.pkl` | < 1 KB | Fitted `OneHotEncoder` for `Veh_Usage` |
-| `label_encoder.pkl` | < 1 KB | Fitted `LabelEncoder` mapping Risk Tier ↔ int |
-| `feature_names.pkl` | < 1 KB | Python list of 14 feature names in training order |
-| `manifest.json` | < 1 KB | Human-readable metadata about the pipeline |
-
----
-
-## 8. Feature Reference
-
-Complete list of the 14 features the model receives (in order):
-
-| # | Feature | Source | Type |
-|---|---|---|---|
-| 1 | `Prev_Accidents` | Raw dataset | Binary int (0/1) |
-| 2 | `Prev_Citations` | Raw dataset | Binary int (0/1) |
-| 3 | `Driving_Exp` | Raw dataset | Int (years) |
-| 4 | `Driver_Age` | Raw dataset | Int (years) |
-| 5 | `Annual_Miles` | Derived from `Annual_Miles_Range` | Int (midpoint miles) |
-| 6 | `Total_Incidents` | Engineered | Int |
-| 7 | `Incident_Score` | Engineered | Int |
-| 8 | `Miles_Per_Exp_Year` | Engineered | Float |
-| 9 | `Risk_Exposure_Index` | Engineered | Float |
-| 10 | `Young_Inexperienced` | Engineered | Binary int (0/1) |
-| 11 | `Age_Exp_Gap` | Engineered | Int |
-| 12 | `Veh_Usage_Business` | OHE from `Veh_Usage` | Binary float (0.0/1.0) |
-| 13 | `Veh_Usage_Commute` | OHE from `Veh_Usage` | Binary float (0.0/1.0) |
-| 14 | `Veh_Usage_Pleasure` | OHE from `Veh_Usage` | Binary float (0.0/1.0) |
-
----
-
-## 9. Inference API Reference
-
-### Standalone (no CrewAI)
-
-```python
-from agent1_risk_profiler import explain_risk_prediction, RiskProfilerPredictor
-import joblib
-
-# Load artifacts manually
-model         = joblib.load("./models/xgb_risk_profiler.pkl")
-explainer     = joblib.load("./models/shap_explainer.pkl")
-ohe           = joblib.load("./models/ohe_encoder.pkl")
-le            = joblib.load("./models/label_encoder.pkl")
-feature_names = joblib.load("./models/feature_names.pkl")
-
-quote = {
-    "Prev_Accidents": 1,
-    "Prev_Citations":  0,
-    "Driving_Exp":     5,
-    "Driver_Age":     24,
-    "Annual_Miles": 32_000,
-    "Veh_Usage":   "Commute",
+```json
+{
+  "status":        "SYSTEM_ALERT: DATA_DRIFT_DETECTED",
+  "feature":       "Annual_Miles",
+  "training_mean": 23269.07,
+  "incoming_mean": 50000.0,
+  "pct_shift_pct": 114.9,
+  "n_samples":     10
 }
-
-result = explain_risk_prediction(
-    quote,
-    model=model,
-    explainer=explainer,
-    ohe=ohe,
-    le=le,
-    feature_names=feature_names,
-    engineered_features=[
-        "Total_Incidents", "Incident_Score", "Miles_Per_Exp_Year",
-        "Risk_Exposure_Index", "Young_Inexperienced", "Age_Exp_Gap",
-    ],
-)
-
-print(result["predicted_tier"])        # "High"
-print(result["confidence"])            # 0.9987
-print(result["top_3_features"])        # [{feature, shap_value, direction, magnitude}, ...]
 ```
 
-### Via `RiskProfilerPredictor` (recommended)
+Every `POST /predict/risk` call includes a `drift_status` object inside `dashboard_metrics`. A monitoring system can poll for `"SYSTEM_ALERT"` in the response to trigger a retraining workflow.
 
-```python
-from agent1_risk_profiler import RiskProfilerPredictor
+---
 
-agent = RiskProfilerPredictor.from_artifacts("./models/")
+## 14. Counterfactual What-If Analyzer
 
-result = agent.predict_and_explain({
-    "Prev_Accidents": 0,
-    "Prev_Citations":  0,
-    "Driving_Exp":    20,
-    "Driver_Age":     42,
-    "Annual_Miles": 10_000,
-    "Veh_Usage":   "Pleasure",
-})
+`RiskProfilerPredictor.generate_counterfactual_advice(quote_data, current_tier)` finds the minimum change that would improve a High or Medium risk customer to Low.
 
-print(result)
+**Algorithm — two levers probed in sequence:**
+
+**Lever A — Mileage Reduction:**
+Iterates `Annual_Miles` down in 1,000 mi steps (floor: 1,000 mi, max 200 iterations) until `predicted_tier == "Low"`.
+
+**Lever B — Incident Record Clearing:**
+Sets both `Prev_Accidents` and `Prev_Citations` to zero and re-predicts.
+
+**Fallback:**
+If neither lever achieves a tier improvement, generic guidance is returned. The dashboard always has actionable text.
+
+**Example outputs:**
+
+```
+"Reducing annual mileage from 40,000 to 12,000 miles would likely
+ transition this profile to a Low Risk tier."
+
+"Clearing the 2 incident record(s) (accidents + citations) would
+ likely transition this profile to a Low Risk tier."
+
+"This profile is currently classified as High Risk. Sustained
+ incident-free driving and a gradual reduction in annual mileage
+ are the strongest levers for improving the risk tier over time."
 ```
 
 ---
 
-## 10. CrewAI Integration Guide
+## 15. Configuration Reference
 
-Wrap `RiskProfilerPredictor` in a CrewAI `BaseTool` subclass:
+All constants are defined at the top of `agents/agent1_risk_profiler.py`.
 
-```python
-from crewai.tools import BaseTool
-from pydantic import BaseModel, Field
-from agent1_risk_profiler import RiskProfilerPredictor
-
-# Load once at module level — avoids reloading on every call
-_agent = RiskProfilerPredictor.from_artifacts("./models/")
-
-
-class RiskProfilerInput(BaseModel):
-    Prev_Accidents: int   = Field(..., description="0 or 1 — prior accident on record")
-    Prev_Citations: int   = Field(..., description="0 or 1 — prior citation on record")
-    Driving_Exp:    int   = Field(..., description="Years of licensed driving experience")
-    Driver_Age:     int   = Field(..., description="Driver age in years")
-    Annual_Miles:   int   = Field(..., description="Estimated annual mileage (numeric)")
-    Veh_Usage:      str   = Field(..., description="Commute | Pleasure | Business")
-
-
-class RiskProfilerTool(BaseTool):
-    name:        str = "risk_profiler"
-    description: str = (
-        "Classifies a driver as Low / Medium / High risk and returns "
-        "a SHAP-based explanation of the top 3 factors driving the decision."
-    )
-    args_schema: type[BaseModel] = RiskProfilerInput
-
-    def _run(self, **kwargs) -> dict:
-        return _agent.predict_and_explain(kwargs)
-```
-
-Then assign the tool to your Agent 1 in your CrewAI crew definition:
-
-```python
-from crewai import Agent
-
-risk_profiler_agent = Agent(
-    role="Risk Profiler",
-    goal="Assess the risk tier of every incoming auto insurance quote",
-    backstory="Expert actuary with 20 years in auto insurance risk classification",
-    tools=[RiskProfilerTool()],
-    verbose=True,
-)
-```
-
----
-
-## 11. Configuration Constants
-
-All key settings are defined at the top of [agent1_risk_profiler.py](agent1_risk_profiler.py) for easy modification:
+### Training constants
 
 | Constant | Value | Description |
 |---|---|---|
-| `DATA_PATH` | `./Autonomous QUOTE AGENTS.csv` | Path to the raw dataset |
-| `MODEL_DIR` | `./models/` | Output directory for all artifacts |
-| `RANDOM_STATE` | `42` | Global random seed for reproducibility |
-| `TEST_SIZE` | `0.20` | Fraction of data reserved for evaluation |
-| `NUMERIC_FEATURES` | 5 base features | Features taken directly from the CSV |
-| `CAT_FEATURES` | `["Veh_Usage"]` | Features requiring One-Hot Encoding |
-| `MILES_MAP` | Dict of 7 entries | Maps range strings → numeric midpoints |
+| `RANDOM_STATE` | `42` | Global random seed |
+| `TEST_SIZE` | `0.20` | 20% held-out test split |
+| `CALIB_SIZE` | `0.20` | 20% of train-val for isotonic calibration |
+| `NOISE_SCALE` | `2.0` | Gaussian noise σ on actuarial score |
 
-To retrain with different settings (e.g. more search iterations), modify `n_iter` in the `main()` call to `train_model()`.
+### Economic layer
+
+| Constant | Value | Description |
+|---|---|---|
+| `HIGH_RISK_WEIGHT_MULTIPLIER` | `3.0` | Sample weight multiplier for High class |
+| `MEDIUM_RISK_WEIGHT_MULTIPLIER` | `2.0` | Sample weight multiplier for Medium class |
+
+### OOD detector
+
+| Constant | Value | Description |
+|---|---|---|
+| `OOD_N_ESTIMATORS` | `200` | IsolationForest tree count |
+| `OOD_SCORE_PERCENTILE` | `0.01` | 0.01th percentile threshold (blocks only extreme outliers) |
+| `OOD_FLAG` | `"ACTION_REQUIRED: DATA_ANOMALY"` | Status string on anomaly detection |
+
+### Drift monitor
+
+| Constant | Value | Description |
+|---|---|---|
+| `DRIFT_THRESHOLD_PCT` | `0.10` | 10% mean shift triggers alert |
+| `DRIFT_ALERT_STATUS` | `"SYSTEM_ALERT: DATA_DRIFT_DETECTED"` | Alert status string |
+
+### Counterfactual search
+
+| Constant | Value | Description |
+|---|---|---|
+| `CF_MILES_STEP` | `1,000` | Mileage reduction step size per iteration |
+| `CF_MAX_ITER` | `200` | Maximum search iterations (safety cap) |
+
+### API (app.py)
+
+| Constant | Value | Description |
+|---|---|---|
+| `CONFIDENCE_GATE` | `0.60` | Predictions below this → `LOW_CONFIDENCE_ESCALATE` |
+| `LOW_CONF_STATUS` | `"LOW_CONFIDENCE_ESCALATE"` | Status string for borderline cases |
+| `OOD_ESCALATE_STATUS` | `"ACTION_REQUIRED: DATA_ANOMALY_ESCALATE"` | API-layer OOD status |
 
 ---
 
-*Agent 1 – Risk Profiler | Auto Insurance Multi-Agent Pipeline | Trained March 5, 2026*
+## 16. Key Design Decisions
+
+### Why Gaussian noise on labels?
+A deterministic label formula produces 100% training accuracy — the model memorises the formula instead of learning insurance risk. Adding `σ=2.0` Gaussian noise forces the model to learn probability distributions, producing realistic calibrated outputs (e.g., 72% High rather than 100%).
+
+### Why `neg_log_loss` for hyperparameter search?
+Accuracy rewards confident correct predictions but ignores calibration quality. Log-loss penalises *confidently wrong* predictions more heavily, which is exactly what an insurance model needs — a wrong but confident tier assignment is more damaging than an uncertain one.
+
+### Why `CalibratedClassifierCV(isotonic, prefit)`?
+Raw XGBoost probabilities are not reliably calibrated on imbalanced data. Isotonic regression (non-parametric) on a **held-out** calibration split corrects the probability estimates without touching the model's decision boundaries.
+
+### Why train IsolationForest on raw features only?
+Interaction features like `Miles_Per_Exp = Annual_Miles / (Driving_Exp + 1)` amplify corrupt inputs — `9,999,999 / 1 = 9,999,999`. This saturates IsolationForest's path-length depth, making the corrupt record look statistically "average". Training on the 8 raw features preserves the extreme signal in individual values like `Annual_Miles = 9,999,999`.
+
+### Why a two-layer safety gate?
+- The **Physics Check** (Layer 2) handles violations detectable by logic alone — negative values, impossible age/experience combinations. It requires no training data and cannot be fooled.
+- The **IsolationForest** (Layer 3) handles statistically anomalous inputs that look syntactically valid — unusual but physically plausible combinations that sit far outside the training distribution.
+
+### Why `shutil.rmtree` instead of per-file deletion?
+Listing specific files to delete requires the cleanup function to be updated every time an artifact is added or renamed. `rmtree` guarantees that no renamed or orphaned file from any previous version can persist and be silently loaded.
+
+### Why a singleton predictor in the API?
+Each `joblib.load` of the 6+ MB SHAP explainer takes ~1 second. Loading on every request would cap throughput at ~1 req/s. The `lifespan` context manager loads everything once at startup; all requests share a single in-memory predictor instance.
