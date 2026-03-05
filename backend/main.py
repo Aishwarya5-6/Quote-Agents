@@ -70,7 +70,7 @@ from agents.agent1_risk_profiler import OOD_FLAG, RiskProfilerPredictor   # noqa
 from agents.agent2_conversion_predictor import ConversionPredictor         # noqa: E402
 from agents.agent3 import advise_premium                                   # noqa: E402
 from agents.agent4 import (                                                # noqa: E402
-    DEC_APPROVE, DEC_ESCALATE, DEC_FOLLOWUP,
+    DEC_APPROVE, DEC_ESCALATE, DEC_FOLLOWUP, DEC_REJECT,
     RISK_HIGH, RISK_LOW, RISK_MEDIUM,
     route_decision,
 )
@@ -259,6 +259,7 @@ _TIER_TO_INT: Dict[str, int] = {"Low": RISK_LOW, "Medium": RISK_MEDIUM, "High": 
 # Map agent4 DEC_* decision label → canonical final_routing_decision value
 _DEC_TO_CANONICAL: Dict[str, str] = {
     DEC_APPROVE:  "AUTO_APPROVE",
+    DEC_REJECT:   "REJECT",
     DEC_ESCALATE: "MANUAL_REVIEW",
     DEC_FOLLOWUP: "MANUAL_REVIEW",
 }

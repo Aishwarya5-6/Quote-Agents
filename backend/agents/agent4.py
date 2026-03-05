@@ -134,6 +134,7 @@ RISK_HIGH   = 2
 
 # Decision labels
 DEC_ESCALATE  = "Escalate to Underwriter"
+DEC_REJECT    = "Reject Application"
 DEC_APPROVE   = "Auto Approve"
 DEC_FOLLOWUP  = "Agent Follow-Up"
 
@@ -145,7 +146,8 @@ PRI_LOW    = "Low"
 # Conversion score thresholds
 ESCALATE_HARD_THRESHOLD    = 30   # below this → always escalate
 ESCALATE_ACCIDENT_THRESHOLD = 50  # accident present AND score below this → escalate
-AUTO_APPROVE_MIN_SCORE     = 60   # minimum score for auto-approval
+REJECT_CONVERSION_CEILING  = 20   # High risk + score below this → reject outright
+AUTO_APPROVE_MIN_SCORE     = 45   # minimum score for auto-approval (lowered for reachability)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +202,51 @@ def route_decision(
     prev_citations   = int(quote_dict.get("Prev_Citations", 0))
 
     # ------------------------------------------------------------------
-    # Stage 1 — ESCALATION RULES  (evaluated first; strict priority)
+    # Stage 0 — REJECTION  (hard deny for the absolute worst-case profiles)
+    # High risk + near-zero conversion + multiple accidents → the
+    # risk-reward is so unfavourable that escalation to an underwriter
+    # would waste their time.  Reject outright.
+    # Evaluated BEFORE escalation so the worst cases never reach Stage 1.
+    # ------------------------------------------------------------------
+    reject = (
+        risk_tier == RISK_HIGH
+        and conversion_score < REJECT_CONVERSION_CEILING
+        and prev_accidents >= 2
+    )
+
+    if reject:
+        internal_reason = (
+            f"High risk tier with critically low conversion score "
+            f"({conversion_score:.0f}) and {prev_accidents} prior accidents — "
+            f"application does not meet minimum underwriting criteria"
+        )
+        decision  = DEC_REJECT
+        priority  = PRI_HIGH
+        human_req = False
+        action_items = [
+            "Application automatically rejected",
+            "Notify applicant of denial",
+            "Retain record for audit trail",
+        ]
+        reason = _llm_reason(
+            risk_label=risk_label,
+            risk_tier=risk_tier,
+            conversion_score=conversion_score,
+            premium_flag=premium_flag,
+            decision=decision,
+            internal_reason=internal_reason,
+            fallback=internal_reason,
+        )
+        return {
+            "decision":       decision,
+            "reason":         reason,
+            "human_required": human_req,
+            "priority":       priority,
+            "action_items":   action_items,
+        }
+
+    # ------------------------------------------------------------------
+    # Stage 1 — ESCALATION RULES  (strict priority)
     # Any single match routes immediately to underwriter review.
     # ------------------------------------------------------------------
     escalation_reasons = []
@@ -265,8 +311,9 @@ def route_decision(
         }
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Stage 2 — AUTO APPROVAL  (ALL conditions must be true)
-    # Only reached when no escalation rule fired.
+    # Only reached when no rejection or escalation rule fired.
     # ------------------------------------------------------------------
 
     # Rules A1-A4: clean slate — low risk, high buying intent, no price
