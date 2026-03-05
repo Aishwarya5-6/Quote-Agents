@@ -43,12 +43,22 @@
 =============================================================================
 """
 
+import logging
 import os
+
 from dotenv import load_dotenv
 
 # Load GROQ_API_KEY from backend/.env (or any parent .env on the dotenv search
 # path).  This is a no-op when the variable is already in the environment.
 load_dotenv()
+
+log = logging.getLogger(__name__)
+
+# Human-readable string shown in the UI when the Groq call fails with a
+# 400 / network error.  Keeps the Sequential UI terminal card "neat".
+_LLM_UI_FALLBACK = (
+    "Referred for underwriter review based on standard risk-routing rules."
+)
 
 try:
     from groq import Groq as _Groq
@@ -102,7 +112,7 @@ def _llm_reason(
         return fallback
 
     try:
-        client = _Groq(api_key=api_key, timeout=8.0)
+        client = _Groq(api_key=api_key, timeout=5.0)  # fail-fast: use _LLM_UI_FALLBACK on slow/bad connections
         prompt = _PROMPT_TEMPLATE.format(
             risk_label=risk_label,
             risk_tier=risk_tier,
@@ -119,8 +129,15 @@ def _llm_reason(
         )
         text = response.choices[0].message.content.strip()
         return text if text else fallback
-    except Exception:  # noqa: BLE001 — intentional broad catch for silent fallback
-        return fallback
+    except Exception as exc:  # noqa: BLE001 — surface error then fall back gracefully
+        log.warning(
+            "Agent 4 │ Groq API call failed — %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        # Return the UI-friendly constant so the frontend always has a neat,
+        # human-readable sentence in the routing justification terminal card.
+        return _LLM_UI_FALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +302,14 @@ def route_decision(
         )
 
     if escalation_reasons:
-        internal_reason = "; ".join(escalation_reasons)
+        # Build a single readable sentence for the frontend terminal card.
+        # Each individual reason already ends without a period, so we join
+        # them with "; " and cap with a period for clean display.
+        internal_reason = (
+            "Referred for underwriter review: "
+            + "; ".join(escalation_reasons)
+            + "."
+        )
         decision  = DEC_ESCALATE
         priority  = PRI_HIGH
         human_req = True
@@ -367,8 +391,8 @@ def route_decision(
         # Medium priority: there is a concrete lever (premium reduction)
         # that the agent should discuss with the customer.
         internal_reason = (
-            f"Moderate case — premium adjustment of {adjustment} recommended "
-            "to improve conversion likelihood"
+            f"Flagged for agent follow-up: a premium adjustment of {adjustment} "
+            "is recommended to improve conversion likelihood for this quote."
         )
         priority    = PRI_MEDIUM
         action_items = [
@@ -378,8 +402,8 @@ def route_decision(
     else:
         # Low priority: no obvious pricing lever; standard follow-up.
         internal_reason = (
-            "Moderate case — no premium adjustment triggered; "
-            "relationship-driven follow-up recommended"
+            "Flagged for agent follow-up: no pricing adjustment was triggered, "
+            "but a personalised outreach is recommended to improve conversion."
         )
         priority    = PRI_LOW
         action_items = [

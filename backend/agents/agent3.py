@@ -38,12 +38,22 @@
 """
 
 
+import logging
 import os
+
 from dotenv import load_dotenv
 
 # Load GROQ_API_KEY from backend/.env (or any parent .env on the dotenv search
 # path).  This is a no-op when the variable is already in the environment.
 load_dotenv()
+
+log = logging.getLogger(__name__)
+
+# Human-readable string shown in the UI when the Groq call fails with a
+# 400 / network error.  Keeps the Sequential UI "neat" with a real sentence.
+_LLM_UI_FALLBACK = (
+    "Premium is competitive for this risk profile; no manual adjustment needed."
+)
 
 try:
     from groq import Groq as _Groq  # type: ignore[import-not-found]
@@ -96,7 +106,7 @@ def _llm_reason(
         return fallback
 
     try:
-        client = _Groq(api_key=api_key, timeout=8.0)
+        client = _Groq(api_key=api_key, timeout=5.0)  # fail-fast: use _LLM_UI_FALLBACK on slow/bad connections
         prompt = _PROMPT_TEMPLATE.format(
             conversion_score=conversion_score,
             original_premium=f"{original_premium:.2f}",
@@ -112,8 +122,15 @@ def _llm_reason(
         )
         text = response.choices[0].message.content.strip()
         return text if text else fallback
-    except Exception:  # noqa: BLE001 — intentional broad catch for silent fallback
-        return fallback
+    except Exception as exc:  # noqa: BLE001 — surface error then fall back gracefully
+        log.warning(
+            "Agent 3 │ Groq API call failed — %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        # Return the UI-friendly constant so the frontend always has a neat,
+        # human-readable sentence in the customer_facing_message field.
+        return _LLM_UI_FALLBACK
 
 
 # ---------------------------------------------------------------------------

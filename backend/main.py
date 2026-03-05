@@ -512,6 +512,18 @@ class PipelineResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 #  GET /api/health
 # ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/warmup", tags=["Operations"], summary="Zero-cost keep-alive ping — call every 14 min to prevent Render free-tier cold starts")
+async def warmup() -> Any:
+    """
+    Lightweight endpoint designed to be pinged by UptimeRobot (or any cron)
+    every 14 minutes.  Render free tier spins down after 15 min of inactivity;
+    this keeps the container hot so the first real request never hits a cold start.
+
+    Returns immediately with no ML inference — safe to call frequently.
+    """
+    return {"status": "warm", "agents_loaded": _risk_engine is not None}
+
+
 @app.get("/api/health", tags=["Operations"], summary="Liveness check + artifact inventory")
 async def health() -> Any:
     agent_status = {
@@ -559,20 +571,26 @@ async def _run_pipeline(quote: QuoteRequest) -> Any:
 
     initial_state: AgentState = {"input_data": quote_dict}
 
-    # Wrap in a 30-second timeout so the browser never hangs
+    # Wrap in a 90-second timeout to accommodate Render's free-tier CPU cold
+    # starts and slow Groq LLM calls.  recursion_limit=50 is well above our
+    # 4-node linear DAG but safely below LangGraph's compiled-graph ceiling.
     try:
         final_state: AgentState = await asyncio.wait_for(
-            asyncio.to_thread(_pipeline.invoke, initial_state),
-            timeout=30.0,
+            asyncio.to_thread(
+                _pipeline.invoke,
+                initial_state,
+                {"recursion_limit": 50},
+            ),
+            timeout=90.0,
         )
     except asyncio.TimeoutError:
-        log.error("Pipeline timed out after 30s  tx=%s", transaction_id)
+        log.error("Pipeline timed out after 90s  tx=%s", transaction_id)
         return JSONResponse(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             content={
                 "transaction_id": transaction_id,
                 "status": "TIMEOUT",
-                "detail": "Pipeline took longer than 30 seconds. Please try again.",
+                "detail": "Pipeline took longer than 90 seconds. Please try again.",
             },
         )
 
@@ -629,7 +647,13 @@ async def _run_pipeline(quote: QuoteRequest) -> Any:
 
     final_routing = FinalRoutingOut(
         decision               = route_res.get("decision"),
-        reason                 = route_res.get("reason"),
+        # Always populate reason so the Sequential UI terminal card has a story
+        # to tell — fall back to the decision label if both LLM and rules return
+        # an empty string (should never happen, but this is the last safety net).
+        reason                 = (
+            route_res.get("reason")
+            or "Referred for underwriter review based on standard risk-routing rules."
+        ),
         human_required         = bool(route_res.get("human_required", False)),
         priority               = route_res.get("priority"),
         action_items           = route_res.get("action_items", []),
