@@ -1,139 +1,99 @@
 "use client";
 
-import { Sparkles, Terminal, ChevronRight } from "lucide-react";
-import type { AdvisorStrategy, FinalRouting, RoutingStatus } from "@/lib/mockData";
+import { Sparkles, Terminal, ChevronRight, DollarSign, ArrowDown } from "lucide-react";
+import type { AdvisorStrategy } from "@/lib/api-contract";
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Per-routing visual config
-// ─────────────────────────────────────────────────────────────────────────────
-const ROUTING = {
-  AUTO_APPROVE: {
-    label: "Auto Approve",
-    color: "text-emerald-400",
-    border: "border-emerald-500/40",
-    dot: "bg-emerald-400",
-  },
-  ESCALATE: {
-    label: "Escalate",
-    color: "text-rose-400",
-    border: "border-rose-500/40",
-    dot: "bg-rose-400",
-  },
-  MANUAL_REVIEW: {
-    label: "Manual Review",
-    color: "text-amber-400",
-    border: "border-amber-500/40",
-    dot: "bg-amber-400",
-  },
-} satisfies Record<RoutingStatus, object>;
-
-export default function AdvisorPanel({
-  advisor,
-  routing,
-}: {
-  advisor: AdvisorStrategy;
-  routing: FinalRouting;
-}) {
-  const rc = ROUTING[routing.routing_status] ?? ROUTING.MANUAL_REVIEW;
+export default function AdvisorPanel({ data }: { data: AdvisorStrategy }) {
+  const hasDiscount = data.premium_flag && data.suggested_discount_pct !== "none";
+  const discountLabel = data.suggested_discount_pct ?? "none";
+  const recommended = data.recommended_premium ?? 0;
+  const original = data.original_premium ?? recommended;
+  const savings = original - recommended;
 
   return (
     <div className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-6 flex flex-col gap-6">
-      {/* ── Header ──────────────────────────────────────────────────── */}
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Sparkles className="w-3.5 h-3.5 text-violet-400" />
           <span className="text-[10px] font-mono tracking-[0.2em] text-slate-500 uppercase">
-            Agents 3 &amp; 4 · Advisor + Routing
+            Agent 3 · AI Premium Advisor
           </span>
         </div>
-        <div
-          className={`flex items-center gap-1.5 text-xs font-mono font-semibold px-2.5 py-0.5 rounded-full border ${rc.border} ${rc.color}`}
-        >
-          <span className={`w-1.5 h-1.5 rounded-full ${rc.dot} animate-pulse`} />
-          {rc.label}
-        </div>
+        {data.premium_flag ? (
+          <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full border border-violet-500/40 text-violet-400">
+            Adjustment Active
+          </span>
+        ) : (
+          <span className="text-[10px] font-mono px-2.5 py-0.5 rounded-full border border-slate-700 text-slate-500">
+            No Adjustment
+          </span>
+        )}
       </div>
 
-      {/* ── Suggested discount ──────────────────────────────────────── */}
-      <div className="flex items-center gap-3 rounded-lg border border-violet-500/20 bg-slate-900/60 px-4 py-3">
-        <Sparkles className="w-5 h-5 text-violet-400 shrink-0" />
-        <div>
-          <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
-            Suggested Discount
-          </p>
-          <p className="text-2xl font-bold text-violet-300 tabular-nums">
-            {advisor.suggested_discount_pct}% off
-          </p>
-        </div>
-      </div>
+      {/* Premium comparison */}
+      {hasDiscount ? (
+        <div className="grid grid-cols-3 gap-3">
+          <div className="rounded-lg border border-slate-700/60 bg-slate-900/60 p-4 text-center">
+            <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest mb-2">
+              Original
+            </p>
+            <p className="text-xl font-bold text-slate-400 tabular-nums line-through decoration-rose-500/60">
+              ${original.toFixed(0)}
+            </p>
+          </div>
 
-      {/* ── Customer-facing message — LLM chat bubble ───────────────── */}
+          <div className="rounded-lg border border-violet-500/30 bg-violet-500/10 p-4 text-center flex flex-col items-center justify-center">
+            <ArrowDown className="w-4 h-4 text-violet-400 mb-1" />
+            <p className="text-lg font-bold text-violet-300 tabular-nums">
+              {discountLabel}
+            </p>
+            <p className="text-[10px] font-mono text-violet-400/70 mt-0.5">
+              −${savings.toFixed(0)} saved
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-center">
+            <p className="text-[10px] font-mono text-slate-500 uppercase tracking-widest mb-2">
+              Recommended
+            </p>
+            <p className="text-xl font-bold text-emerald-400 tabular-nums">
+              ${recommended.toFixed(0)}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-slate-700/60 bg-slate-900/60 p-4 flex items-center gap-3">
+          <DollarSign className="w-5 h-5 text-emerald-400 shrink-0" />
+          <div>
+            <p className="text-sm text-slate-300">
+              Premium holds at <span className="font-bold text-emerald-400">${original.toFixed(0)}</span>
+            </p>
+            <p className="text-[10px] font-mono text-slate-500 mt-0.5">
+              Conversion score above activation gate — no discount needed
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Customer-facing message — typewriter font */}
       <div>
         <p className="text-[10px] font-mono uppercase tracking-widest text-slate-500 mb-2 flex items-center gap-1.5">
           <ChevronRight className="w-3 h-3" />
           Customer-Facing Message
         </p>
-
-        {/* Chat bubble */}
         <div className="relative rounded-xl rounded-tl-none border border-violet-500/20 bg-slate-900/80 px-4 py-3">
-          {/* Corner notch */}
           <div className="absolute -top-px left-0 w-3 h-3 overflow-hidden">
             <div className="w-3 h-3 bg-violet-500/20 rounded-br-full" />
           </div>
-          <p className="text-sm text-slate-200 leading-relaxed">
-            {advisor.customer_facing_message}
+          <p className="text-sm text-slate-200 leading-relaxed font-typewriter">
+            {data.customer_facing_message || "No advisor message generated."}
           </p>
           <div className="mt-2.5 flex items-center gap-1">
             <Sparkles className="w-2.5 h-2.5 text-violet-500" />
             <span className="text-[10px] font-mono text-violet-500">
               Generated by LLM · Agent 3
             </span>
-          </div>
-        </div>
-      </div>
-
-      {/* ── Internal reasoning — terminal window ────────────────────── */}
-      <div>
-        <p className="text-[10px] font-mono uppercase tracking-widest text-slate-500 mb-2 flex items-center gap-1.5">
-          <Terminal className="w-3 h-3" />
-          Internal Reasoning
-        </p>
-
-        <div className="rounded-lg border border-slate-700/60 bg-slate-950 p-4 font-mono">
-          {/* Fake window chrome */}
-          <div className="flex items-center gap-2 mb-3 pb-2.5 border-b border-slate-800/80">
-            <span className="w-2.5 h-2.5 rounded-full bg-rose-500/60" />
-            <span className="w-2.5 h-2.5 rounded-full bg-amber-500/60" />
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500/60" />
-            <span className="ml-2 text-[10px] text-slate-600 tracking-wider">
-              agent4_router.log
-            </span>
-          </div>
-
-          {/* Log lines */}
-          <div className="flex gap-2 text-xs mb-1.5">
-            <span className="text-emerald-500 shrink-0 select-none">›</span>
-            <p className="text-slate-400 leading-relaxed">{advisor.internal_reasoning}</p>
-          </div>
-          <div className="flex gap-2 text-xs mb-1">
-            <span className="text-emerald-500 shrink-0 select-none">›</span>
-            <p className="text-slate-600">
-              routing_decision:{" "}
-              <span className={rc.color}>{routing.routing_status}</span>
-            </p>
-          </div>
-          <div className="flex gap-2 text-xs mb-2">
-            <span className="text-emerald-500 shrink-0 select-none">›</span>
-            <p className="text-slate-600">
-              justification:{" "}
-              <span className="text-slate-400">{routing.underwriter_justification}</span>
-            </p>
-          </div>
-
-          {/* Blinking cursor */}
-          <div className="flex gap-2 text-xs items-center">
-            <span className="text-emerald-500 shrink-0 select-none">›</span>
-            <span className="inline-block w-1.5 h-3.5 bg-slate-400 animate-pulse rounded-sm" />
           </div>
         </div>
       </div>

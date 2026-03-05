@@ -1,109 +1,112 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  CONTRACT-FIRST API TYPES
-//  This file is the single source of truth for the shape returned by
-//  POST http://localhost:8001/api/process_quote
+//  Single source of truth matching the Pydantic schemas in backend/main.py
 //
-//  Each type maps directly to one agent's output:
-//    RiskAssessment    ← Agent 1  (agent1_risk_profiler.py)
-//    ConversionMetrics ← Agent 2
-//    AdvisorStrategy   ← Agent 3
-//    FinalRouting      ← Agent 4
+//  Endpoint: POST http://localhost:8001/api/v1/full-analysis
+//
+//  Each type maps to one agent's output:
+//    RiskAssessment    ← Agent 1  (XGBoost + SHAP + OOD Gate)
+//    ConversionMetrics ← Agent 2  (SMOTE + CalibratedClassifierCV)
+//    AdvisorStrategy   ← Agent 3  (Rules + Groq LLM)
+//    FinalRouting      ← Agent 4  (Rules + Groq LLM)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type RiskTier      = "Low" | "Medium" | "High";
-export type OodFlag       = "OK" | "ACTION_REQUIRED: DATA_ANOMALY";
-export type SalesStatus   = "NEAR_MISS" | "HOT_LEAD" | "COLD" | "CONVERTED";
-export type RoutingStatus = "AUTO_APPROVE" | "ESCALATE" | "MANUAL_REVIEW";
+export const API_BASE = "http://localhost:8001";
 
-// ── Agent 1 ──────────────────────────────────────────────────────────────────
+// ── Enums ────────────────────────────────────────────────────────────────────
+export type RiskTier = "Low" | "Medium" | "High";
+
+export type SalesStatus =
+  | "HIGH_PROPENSITY"
+  | "NEAR_MISS_FOR_ADVISOR"
+  | "LOW_PROB"
+  | "UNCERTAIN";
+
+export type RoutingDecision = "AUTO_APPROVE" | "MANUAL_REVIEW" | "REJECT";
+
+export type AgentDecision =
+  | "Auto Approve"
+  | "Escalate to Underwriter"
+  | "Agent Follow-Up";
+
+export type ShapMagnitude = "HIGH" | "MEDIUM" | "LOW";
+
+// ── Agent 1 — Risk Profiler ─────────────────────────────────────────────────
 export interface ShapDriver {
-  /** Raw feature name from the XGBoost model */
-  feature: string;
-  /** Raw SHAP value for the predicted class. Sign is relative to predicted class — use fixShapLabel() before displaying */
-  value: number;
-  /** Raw label from agent — use fixShapLabel() to correct for Low-tier predictions */
-  impact: string;
+  feature:    string;
+  shap_value: number;
+  direction:  string;   // "↑ increases risk" | "↓ decreases risk"
+  magnitude:  ShapMagnitude;
 }
 
 export interface RiskAssessment {
-  predicted_tier:    RiskTier;
-  /** Calibrated probability for the predicted class: 0.0 – 1.0 */
-  confidence_score:  number;
-  /** IsolationForest + Physics Check gate result */
-  ood_flag:          OodFlag;
-  /** Top SHAP contributors sorted by |value| descending */
-  top_shap_drivers:  ShapDriver[];
+  predicted_tier:      RiskTier;
+  confidence_score:    number;          // 0.0 – 1.0
+  ood_flag:            string;          // "OK"
+  class_probabilities: Record<string, number>;
+  top_shap_drivers:    ShapDriver[];
 }
 
-// ── Agent 2 ──────────────────────────────────────────────────────────────────
+// ── Agent 2 — Conversion Predictor ──────────────────────────────────────────
 export interface ConversionMetrics {
-  /** Predicted probability that the quote converts to a bound policy: 0.0 – 1.0 */
-  bind_probability:          number;
-  sales_status:              SalesStatus;
-  /** How far (as a decimal fraction) the quote is below the conversion threshold */
-  distance_to_conversion:    number;
+  bind_probability:       number | null;  // 0.0 – 1.0
+  sales_status:           SalesStatus | null;
+  distance_to_conversion: number | null;  // ≥ 0
 }
 
-// ── Agent 3 ──────────────────────────────────────────────────────────────────
+// ── Agent 3 — Premium Advisor ───────────────────────────────────────────────
 export interface AdvisorStrategy {
-  suggested_discount_pct:   number;
-  /** LLM-generated message shown directly to the customer */
-  customer_facing_message:  string;
-  /** LLM chain-of-thought reasoning visible to agents/underwriters only */
-  internal_reasoning:       string;
+  premium_flag:            boolean;
+  suggested_discount_pct:  string | null;  // e.g. "-15%" or "none"
+  recommended_premium:     number | null;
+  original_premium:        number | null;
+  customer_facing_message: string | null;  // LLM-enriched or rule-based reason
 }
 
-// ── Agent 4 ──────────────────────────────────────────────────────────────────
+// ── Agent 4 — Underwriting Router ───────────────────────────────────────────
 export interface FinalRouting {
-  routing_status:              RoutingStatus;
-  underwriter_justification:   string;
+  decision:               AgentDecision | null;
+  reason:                 string | null;   // LLM-enriched 2-sentence justification
+  human_required:         boolean;
+  priority:               string | null;   // "High" | "Medium" | "Low"
+  action_items:           string[];
+  final_routing_decision: RoutingDecision | null;
 }
 
-// ── Master pipeline response ──────────────────────────────────────────────────
+// ── Master pipeline response ────────────────────────────────────────────────
 export interface PipelineResponse {
-  /** UUID v4 — unique per quote request */
-  transaction_id:      string;
-  risk_assessment:     RiskAssessment;
-  conversion_metrics:  ConversionMetrics;
-  advisor_strategy:    AdvisorStrategy;
-  final_routing:       FinalRouting;
+  transaction_id:         string;
+  status:                 string;  // "OK" | "LOW_CONFIDENCE_ESCALATE"
+  final_routing_decision: RoutingDecision | null;
+  escalation_reason:      string | null;
+  risk_assessment:        RiskAssessment  | null;
+  conversion_metrics:     ConversionMetrics | null;
+  advisor_strategy:       AdvisorStrategy | null;
+  final_routing:          FinalRouting    | null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MOCK PIPELINE RESPONSE
-//  Copy-paste ready for frontend development.
-//  Replace the fetch() call in app/page.tsx to go live.
-// ─────────────────────────────────────────────────────────────────────────────
-export const MOCK_PIPELINE_RESPONSE: PipelineResponse = {
-  transaction_id: "a3f7c9d2-81b4-4e2a-9c6f-1d8e2b4a7f3c",
+// ── OOD Error response (HTTP 422) ───────────────────────────────────────────
+export interface OodErrorResponse {
+  transaction_id: string;
+  status:         string;   // "ACTION_REQUIRED: DATA_ANOMALY_ESCALATE"
+  message:        string;
+  input:          Record<string, unknown>;
+}
 
-  risk_assessment: {
-    predicted_tier:   "Low",
-    confidence_score: 0.89,
-    ood_flag:         "OK",
-    top_shap_drivers: [
-      { feature: "Prev_Accidents",   value: -0.45, impact: "decreases risk" },
-      { feature: "Annual_Miles",     value: -0.31, impact: "decreases risk" },
-      { feature: "Driving_Exp",      value:  0.28, impact: "increases risk" },
-      { feature: "Age_Exp_Gap",      value: -0.19, impact: "decreases risk" },
-      { feature: "Total_Incidents",  value: -0.14, impact: "decreases risk" },
-    ],
-  },
+// ── Quote input ─────────────────────────────────────────────────────────────
+export interface QuoteInput {
+  Driver_Age:        number;
+  Driving_Exp:       number;
+  Prev_Accidents:    number;
+  Prev_Citations:    number;
+  Annual_Miles:      number;
+  Veh_Usage:         "Business" | "Commute" | "Pleasure";
+  Quoted_Premium?:   number;
+  Sal_Range?:        number;
+  Coverage?:         number;
+  Vehicl_Cost_Range?: number;
+  Re_Quote?:         number;
+}
 
-  conversion_metrics: {
-    bind_probability:       0.35,
-    sales_status:           "NEAR_MISS",
-    distance_to_conversion: 0.03,
-  },
-
-  advisor_strategy: {
-    suggested_discount_pct:  5.0,
-    customer_facing_message: "Great news! Your clean driving record qualifies you for a 5% loyalty discount. Lock in this rate today.",
-    internal_reasoning:      "Driver is Low Risk (89% confidence) but a NEAR_MISS for conversion. A 5% discount bridges the remaining 3% gap without eroding underwriting margin.",
-  },
-
-  final_routing: {
-    routing_status:            "AUTO_APPROVE",
-    underwriter_justification: "Low Risk tier · 89% model confidence · OOD gate clear · No adverse SHAP drivers. Auto-approval criteria met.",
-  },
-};
+// ── Conversion threshold (from Agent 2 v2 training) ─────────────────────────
+export const CONVERSION_THRESHOLD = 0.3370;
