@@ -2,7 +2,8 @@
 
 import { useState, useCallback, useRef } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Cpu, Zap, Clock, Shield, BarChart2, MessageSquare, Gavel } from "lucide-react";
+import { Cpu, Zap, Clock, Shield, BarChart2, MessageSquare, Gavel, Activity } from "lucide-react";
+import Link from "next/link";
 
 import {
   API_BASE,
@@ -239,6 +240,13 @@ export default function DashboardPage() {
           </div>
 
           <div className="flex items-center gap-3">
+            <Link
+              href="/dashboard"
+              className="flex items-center gap-1.5 text-xs font-mono text-slate-500 hover:text-violet-300 border border-slate-700 hover:border-violet-500/40 rounded-lg px-3 py-1.5 transition-colors"
+            >
+              <Activity className="w-3 h-3" />
+              Ops Dashboard
+            </Link>
             {isComplete && data && (
               <>
                 <span className="text-xs font-mono text-slate-500 border border-slate-700 rounded-full px-3 py-1 flex items-center gap-1.5">

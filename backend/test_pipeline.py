@@ -290,6 +290,7 @@ def validate_agent4(
         "Auto Approve",
         "Escalate to Underwriter",
         "Agent Follow-Up",
+        "Reject Application",
     }
     decision = final.get("decision")
     check(
