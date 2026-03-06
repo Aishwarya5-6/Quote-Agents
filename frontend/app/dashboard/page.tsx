@@ -201,6 +201,16 @@ export default function OperationsDashboardPage() {
     } catch (err: unknown) {
       const elapsed = performance.now() - t0;
       const msg = err instanceof Error ? err.message : "Connection failed";
+
+      // Backend is asleep (connection refused) — silently drop this record
+      // and show the warming banner; the interval will auto-retry
+      if (msg === "Failed to fetch") {
+        setRecords(prev => prev.filter(r => r.id !== id));
+        setWarmingUp(true);
+        // inFlightRef released in finally; interval fires again automatically
+        return;
+      }
+
       // Detect cold-start timeout (>= 2 consecutive timeouts)
       if (msg.toLowerCase().includes("timeout") || msg.toLowerCase().includes("timed out")) {
         timeoutStreak.current += 1;

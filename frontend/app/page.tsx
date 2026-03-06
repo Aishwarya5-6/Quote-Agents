@@ -51,6 +51,7 @@ type AppState =
       elapsed: number;
     }
   | { kind: "ood_error"; error: OodErrorResponse }
+  | { kind: "waking"; input: QuoteInput; attempt: number }
   | { kind: "error"; title: string; message: string };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,8 +66,9 @@ const CONNECTOR_COLORS = [
 export default function DashboardPage() {
   const [state, setState] = useState<AppState>({ kind: "idle" });
   const [formVisible, setFormVisible] = useState(true);
-  const timerRef     = useRef<NodeJS.Timeout | null>(null);
-  const lastInputRef  = useRef<QuoteInput | null>(null);
+  const timerRef       = useRef<NodeJS.Timeout | null>(null);
+  const lastInputRef    = useRef<QuoteInput | null>(null);
+  const wakeAttemptRef  = useRef(0);
 
   // ── Warmup ping on mount — wake Render before user submits ────────────
   useEffect(() => {
@@ -130,6 +132,7 @@ export default function DashboardPage() {
 
       if (res.ok) {
         const json: PipelineResponse = await res.json();
+        wakeAttemptRef.current = 0; // reset on success
         setState({
           kind: "complete",
           input,
@@ -192,15 +195,35 @@ export default function DashboardPage() {
       clearTimeout(timeoutId);
       if (timerRef.current) clearInterval(timerRef.current);
       const isTimeout = err instanceof DOMException && err.name === "AbortError";
+
+      // "Failed to fetch" = TCP connection refused = Render is asleep
+      // Auto-retry up to 3 times (45s window) before showing error
+      if (!isTimeout && wakeAttemptRef.current < 3) {
+        wakeAttemptRef.current += 1;
+        setState({ kind: "waking", input, attempt: wakeAttemptRef.current });
+        return;
+      }
+
+      wakeAttemptRef.current = 0;
       setState({
         kind: "error",
         title: isTimeout ? "Request Timed Out" : "Connection Failed",
         message: isTimeout
           ? "The backend took too long to respond. It may be waking up from sleep — please wait 30 seconds and try again."
-          : "The backend is waking up from sleep. Click \"Retry\" below or wait a moment and try again.",
+          : "The backend is still unavailable after multiple retries. Please wait a minute and try again.",
       });
     }
   }, []);
+
+  // ── Auto-retry during cold-start waking ──────────────────────────────
+  useEffect(() => {
+    if (state.kind !== "waking") return;
+    const captured = state.input;
+    const timer = setTimeout(() => {
+      handleAnalyze(captured);
+    }, 15_000); // retry after 15s
+    return () => clearTimeout(timer);
+  }, [state, handleAnalyze]);
 
   // ── handleEdit — re-expand the form ────────────────────────────────────
   const handleEdit = useCallback(() => {
@@ -216,8 +239,9 @@ export default function DashboardPage() {
   // ── Convenience getters ────────────────────────────────────────────────
   const isRunning   = state.kind === "running";
   const isComplete  = state.kind === "complete";
+  const isWaking    = state.kind === "waking";
   const data        = isComplete ? state.data : state.kind === "running" ? state.data : null;
-  const input       = isComplete ? state.input : isRunning ? state.input : null;
+  const input       = isComplete ? state.input : isRunning ? state.input : isWaking ? state.input : null;
   const elapsed     = isComplete ? state.elapsed : 0;
 
   // Card states — when complete, all are revealed
@@ -328,7 +352,30 @@ export default function DashboardPage() {
             isOod
           />
         )}
-
+        {/* ── Backend waking up ────────────────────────────────────── */}
+        {state.kind === "waking" && (
+          <motion.div
+            key="waking"
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="flex flex-col gap-3 px-4 py-4 rounded-xl border border-amber-500/30 bg-amber-500/5 text-amber-200"
+          >
+            <div className="flex items-center gap-2.5">
+              <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+              <span className="font-semibold text-sm">Backend Waking Up</span>
+              <span className="ml-auto text-xs font-mono text-amber-400/70">attempt {state.attempt}/3</span>
+            </div>
+            <p className="text-xs text-amber-300/70 font-mono leading-relaxed">
+              Render free tier spins down after inactivity. Auto-retrying in ~15s…
+            </p>
+            <button
+              onClick={() => { wakeAttemptRef.current = 0; handleAnalyze(state.input); }}
+              className="self-start text-xs font-mono px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-300 transition-colors"
+            >
+              ↺ Retry Now
+            </button>
+          </motion.div>
+        )}
         {/* ── General error ──────────────────────────────────────────── */}
         {state.kind === "error" && (
           <ErrorBanner
