@@ -11,10 +11,11 @@ interface ErrorBannerProps {
   message: string;
   details?: Record<string, unknown>;
   onDismiss?: () => void;
+  onRetry?: () => void;
   isOod?: boolean;
 }
 
-export default function ErrorBanner({ title, message, details, onDismiss, isOod = false }: ErrorBannerProps) {
+export default function ErrorBanner({ title, message, details, onDismiss, onRetry, isOod = false }: ErrorBannerProps) {
   return (
     <motion.div
       initial={{ opacity: 0, y: -10 }}
@@ -41,6 +42,15 @@ export default function ErrorBanner({ title, message, details, onDismiss, isOod 
           </div>
 
           <p className="text-sm text-slate-300 leading-relaxed mb-3">{message}</p>
+
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="mb-3 flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-300 text-sm font-mono transition-colors"
+            >
+              ↺ Retry
+            </button>
+          )}
 
           {details && Object.keys(details).length > 0 && (
             <div className="rounded-lg border border-slate-700/60 bg-slate-950 p-3 font-mono">

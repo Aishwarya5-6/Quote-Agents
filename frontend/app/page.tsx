@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Cpu, Zap, Clock, Shield, BarChart2, MessageSquare, Gavel, Activity } from "lucide-react";
 import Link from "next/link";
@@ -65,10 +65,17 @@ const CONNECTOR_COLORS = [
 export default function DashboardPage() {
   const [state, setState] = useState<AppState>({ kind: "idle" });
   const [formVisible, setFormVisible] = useState(true);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const timerRef     = useRef<NodeJS.Timeout | null>(null);
+  const lastInputRef  = useRef<QuoteInput | null>(null);
+
+  // ── Warmup ping on mount — wake Render before user submits ────────────
+  useEffect(() => {
+    fetch(`${API_BASE}/api/health`, { method: "GET" }).catch(() => {/* silent */});
+  }, []);
 
   // ── handleAnalyze — progressive agent reveal ───────────────────────────
   const handleAnalyze = useCallback(async (input: QuoteInput) => {
+    lastInputRef.current = input;
     // Collapse form
     setFormVisible(false);
 
@@ -190,7 +197,7 @@ export default function DashboardPage() {
         title: isTimeout ? "Request Timed Out" : "Connection Failed",
         message: isTimeout
           ? "The backend took too long to respond. It may be waking up from sleep — please wait 30 seconds and try again."
-          : "Could not reach the backend. Please check your connection and try again.",
+          : "The backend is waking up from sleep. Click \"Retry\" below or wait a moment and try again.",
       });
     }
   }, []);
@@ -200,6 +207,11 @@ export default function DashboardPage() {
     setFormVisible(true);
     setState({ kind: "idle" });
   }, []);
+
+  // ── handleRetry — re-submit the last input without re-filling form ─────
+  const handleRetry = useCallback(() => {
+    if (lastInputRef.current) handleAnalyze(lastInputRef.current);
+  }, [handleAnalyze]);
 
   // ── Convenience getters ────────────────────────────────────────────────
   const isRunning   = state.kind === "running";
@@ -323,6 +335,7 @@ export default function DashboardPage() {
             title={state.title}
             message={state.message}
             onDismiss={handleEdit}
+            onRetry={state.title === "Connection Failed" || state.title === "Request Timed Out" ? handleRetry : undefined}
           />
         )}
 
