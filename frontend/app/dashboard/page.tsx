@@ -127,15 +127,22 @@ function StatCard({ label, value, icon, color, borderColor, subLabel }: StatCard
 //  MAIN DASHBOARD PAGE
 // ─────────────────────────────────────────────────────────────────────────────
 export default function OperationsDashboardPage() {
-  const [running,  setRunning]  = useState(false);
-  const [speedIdx, setSpeedIdx] = useState(1);        // default "Normal (3s)"
-  const [records,  setRecords]  = useState<QuoteRecord[]>([]);
+  const [running,    setRunning]    = useState(false);
+  const [speedIdx,   setSpeedIdx]   = useState(1);        // default "Normal (3s)"
+  const [records,    setRecords]    = useState<QuoteRecord[]>([]);
+  const [warmingUp,  setWarmingUp]  = useState(false);   // cold-start banner
 
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const seqRef      = useRef(0);
+  const intervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const seqRef         = useRef(0);
+  const inFlightRef    = useRef(false);   // prevent concurrent requests
+  const timeoutStreak  = useRef(0);       // consecutive timeout counter
 
   // ── Fire a single quote through the pipeline ────────────────────────────
   const fireQuote = useCallback(async () => {
+    // Skip if a request is already in-flight (backend may be cold-starting)
+    if (inFlightRef.current) return;
+
+    inFlightRef.current = true;
     const id    = crypto.randomUUID();
     const seq   = ++seqRef.current;
     const input = generateRandomQuote();
@@ -152,16 +159,19 @@ export default function OperationsDashboardPage() {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify(input),
-        signal:  AbortSignal.timeout(30_000),
+        signal:  AbortSignal.timeout(90_000),  // 90s — matches Render backend timeout
       });
 
       const elapsed = performance.now() - t0;
+      timeoutStreak.current = 0;
+      setWarmingUp(false);
 
       if (res.ok) {
         const json: PipelineResponse = await res.json();
         setRecords(prev =>
           prev.map(r => r.id === id ? { ...r, status: "done", result: json, elapsed } : r)
         );
+        inFlightRef.current = false;
         return;
       }
 
@@ -176,6 +186,7 @@ export default function OperationsDashboardPage() {
               : r
           )
         );
+        inFlightRef.current = false;
         return;
       }
 
@@ -190,6 +201,14 @@ export default function OperationsDashboardPage() {
     } catch (err: unknown) {
       const elapsed = performance.now() - t0;
       const msg = err instanceof Error ? err.message : "Connection failed";
+      // Detect cold-start timeout (>= 2 consecutive timeouts)
+      if (msg.toLowerCase().includes("timeout") || msg.toLowerCase().includes("timed out")) {
+        timeoutStreak.current += 1;
+        if (timeoutStreak.current >= 2) setWarmingUp(true);
+      } else {
+        timeoutStreak.current = 0;
+        setWarmingUp(false);
+      }
       setRecords(prev =>
         prev.map(r =>
           r.id === id
@@ -197,6 +216,8 @@ export default function OperationsDashboardPage() {
             : r
         )
       );
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 
@@ -395,6 +416,16 @@ export default function OperationsDashboardPage() {
             </button>
           </div>
         </div>
+
+        {/* ── Warming-up banner (Render free tier cold start) ──────────── */}
+        {warmingUp && (
+          <div className="mb-4 flex items-center gap-3 px-4 py-3 rounded-xl border border-amber-500/30 bg-amber-500/5 text-amber-400">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+            <span className="text-xs font-mono">
+              Backend is waking up (Render free tier cold start — up to 60s). Requests are queued and will resume automatically.
+            </span>
+          </div>
+        )}
 
         {/* ── Main Content: Live Feed (left) + Escalation Queue (right) ── */}
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
