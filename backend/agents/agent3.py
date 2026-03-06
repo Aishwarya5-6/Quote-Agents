@@ -194,7 +194,7 @@ def advise_premium(quote_dict: dict, conversion_score: float) -> dict:
     # ------------------------------------------------------------------
     # Gate: if conversion score is already acceptable, do nothing.
     # ------------------------------------------------------------------
-    original_premium = float(quote_dict.get("Quoted_Premium", 0.0))
+    original_premium = float(quote_dict.get("Quoted_Premium") or 0.0)
 
     if conversion_score >= ACTIVATION_THRESHOLD:
         return {
@@ -206,10 +206,10 @@ def advise_premium(quote_dict: dict, conversion_score: float) -> dict:
         }
 
     # Unpack inputs with safe defaults
-    sal_range         = int(quote_dict.get("Sal_Range", 0))
-    coverage          = int(quote_dict.get("Coverage", COV_BASIC))
-    vehicl_cost_range = int(quote_dict.get("Vehicl_Cost_Range", 0))
-    re_quote          = int(quote_dict.get("Re_Quote", 0))
+    sal_range         = int(quote_dict.get("Sal_Range") or 0)
+    coverage          = int(quote_dict.get("Coverage") if quote_dict.get("Coverage") is not None else COV_BASIC)
+    vehicl_cost_range = int(quote_dict.get("Vehicl_Cost_Range") or 0)
+    re_quote          = int(quote_dict.get("Re_Quote") or 0)
 
     # ------------------------------------------------------------------
     # Rule evaluation — collect all triggered reductions and reasons.
