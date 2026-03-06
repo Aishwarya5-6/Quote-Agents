@@ -187,12 +187,13 @@ export default function OperationsDashboardPage() {
             : r
         )
       );
-    } catch {
+    } catch (err: unknown) {
       const elapsed = performance.now() - t0;
+      const msg = err instanceof Error ? err.message : "Connection failed";
       setRecords(prev =>
         prev.map(r =>
           r.id === id
-            ? { ...r, status: "error", elapsed, errorMsg: "Connection failed" }
+            ? { ...r, status: "error", elapsed, errorMsg: msg }
             : r
         )
       );
@@ -238,9 +239,15 @@ export default function OperationsDashboardPage() {
     })
     .slice(0, 20);
 
+  const errorCount = records.filter(r => r.status === "error").length;
+
   const handleClear = () => {
     setRecords([]);
     seqRef.current = 0;
+  };
+
+  const handleDismissErrors = () => {
+    setRecords(prev => prev.filter(r => r.status !== "error"));
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -367,8 +374,17 @@ export default function OperationsDashboardPage() {
             </div>
           </div>
 
-          {/* Clear */}
-          <div className="ml-auto">
+          {/* Clear / Dismiss errors */}
+          <div className="ml-auto flex items-center gap-2">
+            {errorCount > 0 && (
+              <button
+                onClick={handleDismissErrors}
+                className="flex items-center gap-1.5 text-xs font-mono text-amber-500/70 hover:text-amber-400 border border-amber-500/20 hover:border-amber-500/40 rounded-lg px-3 py-1.5 transition-colors"
+              >
+                <XCircle className="w-3 h-3" />
+                Dismiss {errorCount} error{errorCount !== 1 ? "s" : ""}
+              </button>
+            )}
             <button
               onClick={handleClear}
               disabled={records.length === 0}
@@ -504,7 +520,16 @@ export default function OperationsDashboardPage() {
                               ⚠ ANOMALY
                             </span>
                           ) : (
-                            <span className="text-[10px] font-mono text-slate-600">error</span>
+                            <span
+                              className="text-[10px] font-mono text-rose-500/60 truncate"
+                              title={record.errorMsg ?? "Unknown error"}
+                            >
+                              ✕ {record.errorMsg
+                                ? record.errorMsg.length > 18
+                                  ? record.errorMsg.slice(0, 18) + "…"
+                                  : record.errorMsg
+                                : "error"}
+                            </span>
                           )}
 
                           {/* Priority */}
