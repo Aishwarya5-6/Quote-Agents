@@ -524,7 +524,7 @@ async def warmup() -> Any:
     return {"status": "warm", "agents_loaded": _risk_engine is not None}
 
 
-@app.get("/api/health", tags=["Operations"], summary="Liveness check + artifact inventory")
+@app.api_route("/api/health", methods=["GET", "HEAD"], tags=["Operations"], summary="Liveness check + artifact inventory")
 async def health() -> Any:
     agent_status = {
         "agent_1_risk_profiler": "✅ loaded"          if app.state.risk_engine is not None else "❌ not loaded",
